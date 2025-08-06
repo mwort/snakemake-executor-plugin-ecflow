@@ -1,0 +1,5 @@
+
+module load python3
+module load ecflow
+
+source venv/bin/activate

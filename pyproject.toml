@@ -1,0 +1,26 @@
+[build-system]
+requires = [ "poetry-core",]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "snakemake-executor-plugin-ecflow"
+version = "0.1.0"
+description = ""
+authors = [ "Michel Wortmann <michel.wortmann@ecmwf.int>",]
+readme = "README.md"
+repository = "https://github.com/your/plugin"
+documentation = "https://snakemake.github.io/snakemake-plugin-catalog/plugins/executor/ecflow.html"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+snakemake-interface-common = "^1.17.4"
+snakemake-interface-executor-plugins = "^9.3.2"
+pyflow-workflow-generator = "^3.4.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.10.0"
+flake8 = "^7.1.1"
+coverage = "^7.6.4"
+pytest = "^8.3.3"
+ipdb = "^0.13.13"
+snakemake = "^8.25.0"
