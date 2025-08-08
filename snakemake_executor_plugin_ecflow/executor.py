@@ -102,13 +102,14 @@ class Executor(RemoteExecutor):
         self.venv_dir = f"{self.deploy_dir}/venv"
         script = dd(f"""
         {self.load_python}
-        python3 -m virtualenv {self.venv_dir}
+        virtualenv {self.venv_dir}
         source {self.venv_dir}/bin/activate
-        pip install snakemake /home/dimw/src/snakemake-executor-plugin-ecflow
+        pip install snakemake
+        pip install git+https://github.com/mwort/snakemake-executor-plugin-ecflow.git
         """)
         with self.families["make"]:
             env = pf.Task(
-                name="setup_env",
+                name="setup_snakemake_env",
                 script=script,
                 defstatus=pf.state.complete if self.settings.linked else pf.state.queued,
             )
