@@ -1,0 +1,60 @@
+import datetime as dt
+
+end = dt.date.today()
+start = end - dt.timedelta(days=7 - 1)
+
+parameters = {
+    "t2m": 167,
+    "tp": 228228,
+}
+fc_steps = range(0, 18 + 6, 6)
+
+
+rule ECMWF_workflow:
+    input:
+        "report.pdf"
+
+
+rule report:
+    input: expand("{parameter}/{step}.png", parameter=parameters.keys(), step=fc_steps),
+    output: "report.pdf"
+    shell: "convert {input} -quality 100 {output}"
+
+
+rule mars_retrieve:
+    output: "data.grb"
+    shell:
+        f"""
+        mars <<EOF
+        retrieve,
+            class=ai,
+            date={start:%Y-%m-%d}/to/{end:%Y-%m-%d},
+            expver=1,
+            levtype=sfc,
+            model=aifs-single,
+            param={'/'.join(map(str, parameters.values()))},
+            step={'/'.join(map(str, fc_steps))},
+            stream=oper,
+            time=00:00:00,
+            type=fc,
+            target="{{output}}"
+EOF
+        """
+
+rule figures:
+    input: "data.grb"
+    output: "{parameter}/{step}.png"
+    envmodules: "python3"
+    shell:
+        """
+        ipython -c "
+        import xarray as xr, numpy as np, matplotlib.pyplot as plt
+        step = np.timedelta64({wildcards.step}, 'h')
+        ds = xr.open_dataset('{input}').{wildcards.parameter}.sel(step=step).mean(dim='time')
+        fig = plt.figure(figsize=(10, 5))
+        plt.scatter(ds.longitude, ds.latitude, c=ds.values, cmap='viridis', s=0.1)
+        plt.colorbar(label='{wildcards.parameter}')
+        plt.title('{wildcards.parameter} at step {wildcards.step}')
+        fig.savefig('{output}', bbox_inches='tight')
+        "
+        """

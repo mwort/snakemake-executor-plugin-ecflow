@@ -1,0 +1,14 @@
+# snakemake arguments
+executor: ecflow
+ecflow-host: ecflow-gen-$USER-001
+ecflow-deploy: suite
+jobs: 20
+# workflow configuration
+config:
+  fc_length: 18
+  fc_freq: 6
+  date: today  # or a specific date like "2023-10-01"
+  n_past_days: 7
+  parameters:
+    t2m: 167
+    tp: 228228
