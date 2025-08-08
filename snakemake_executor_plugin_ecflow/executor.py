@@ -157,9 +157,12 @@ class Executor(RemoteExecutor):
         tasks = {}
         dag = self.workflow.dag
         self.jobs_and_groups, self.jobs, self.groups = self.get_jobs_and_groups()
+        # global task limit attached to the admin family
+        tlimit = pf.Limit("task_limit", self.workflow.nodes)
+        self.families["admin"].limits = tlimit
         # create tasks first
         for job in self.jobs_and_groups:
-            self.families[job], tasks[job] = self.create_task(job)
+            self.families[job], tasks[job] = self.create_task(job, inlimits=tlimit)
         # assign triggers
         for job, task in tasks.items():
             deps = dag.dependencies[job]
