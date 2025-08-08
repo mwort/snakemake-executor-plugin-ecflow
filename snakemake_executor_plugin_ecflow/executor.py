@@ -243,7 +243,16 @@ class Executor(RemoteExecutor):
         return family
 
     def create_group_families(self, group: str, parent: pf.AnchorFamily) -> pf.AnchorFamily:
-        for sf in pf.ecflow_name(group).split("/"):
+        parts = group.split("/")
+        # first check if any of the standard families match
+        try:
+            parent = family = self.suite.find_node(pf.ecflow_name(parts[0]))
+            parts = parts[1:]
+        except KeyError:
+            pass
+
+        for sf in parts:
+            sf = pf.ecflow_name(sf)
             try:
                 family = parent.find_node(sf)
             except KeyError:

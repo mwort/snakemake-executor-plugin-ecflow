@@ -11,11 +11,17 @@ rule snakemake_ecflow_research_suite:
     input:
         "report.pdf"
 
+rule build_env:
+    output: "env_modules.txt"
+    group: "make/envs"
+    shell: "module list > {output}"
 
 rule report:
-    input: expand("{parameter}/{step}.png", parameter=parameters.keys(), step=fc_steps)
+    input:
+        figures=expand("{parameter}/{step}.png", parameter=parameters.keys(), step=fc_steps),
+        env=rules.build_env.output
     output: "report.pdf"
-    shell: "convert {input} -quality 100 {output}"
+    shell: "convert {input.figures} -quality 100 {output}"
 
 
 rule download_data:
