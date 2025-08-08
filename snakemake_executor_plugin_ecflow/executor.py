@@ -215,21 +215,31 @@ class Executor(RemoteExecutor):
         name_cleaned = pf.ecflow_name(name)
         needsrun = any(j.dag.needrun(j) for j in jobs)
         variables = {k.upper(): v for k, v in wildcards.items()}
+
         if job.is_group():
             variables.update({f"INPUT_{i}": str(j.input) for i, j in enumerate(jobs)})
             variables.update({f"OUTPUT_{i}": str(j.output) for i, j in enumerate(jobs)})
             script = "\n\n".join([self.job_script(j, order=i) for i, j in enumerate(jobs)])
+            ecfp = (getattr(j.params, "ecflow", None) for j in jobs)
+            ecflow_params = {k: v for d in ecfp if d is not None for k, v in d.items()}
         else:
             variables.update({f"INPUT": str(job.input)})
             variables.update({f"OUTPUT": str(job.output)})
             script = self.job_script(job)
+            ecflow_params = getattr(job.params, "ecflow", {})
+
         kwargs.update(variables)
+        kwargs.update(ecflow_params)
+
+        # take the max of resources for all jobs
+        sargs = [self.translate_resources(j) for j in jobs]
+        resources = {k: max(d[k] for d in sargs if k in d) for k in {k for d in sargs for k in d}}
 
         family = self.create_job_family(job)
         with family:
             task = pf.Task(
                 name=name_cleaned,
-                # submit_arguments=job.resources,
+                submit_arguments=resources,
                 script=script,
                 defstatus=pf.state.queued if needsrun else pf.state.complete,
                 **kwargs,
@@ -274,6 +284,21 @@ class Executor(RemoteExecutor):
             with parent:
                 family = pf.AnchorFamily(fname)
         return family
+
+    def translate_resources(self, job: JobExecutorInterface) -> dict:
+        """Translate job resources to ecFlow resources."""
+        accepted_resources = {
+            # sm job.resources keys to troika resources
+            "time": "time",
+            "mem": "memory_per_cpu",
+            "total_tasks": "total_tasks",
+            "_cores": "cpus_per_task",
+            "runtime": "time",
+            "cpus": "cpus_per_task",
+            "tmpdir": "tmpdir",
+        }
+        resources = {v: job.resources.get(k) for k, v in accepted_resources.items()}
+        return {k: v for k, v in resources.items() if v is not None}
 
     def job_script(self, job, order=None) -> str:
         """Return the script to run for a job."""

@@ -87,6 +87,8 @@ class ExecutorSettings(ExecutorSettingsBase):
             "help": "Whether to link the ecflow suite to the project it is launched from, i.e. using the same "
             "Snakefile, python environment, etc. Useful for development.",
             "required": False,
+            "parse_func": lambda x: x.lower() in ("true", "1", "yes"),
+            "unparse_func": lambda x: "true" if x else "false",
         },
     )
     execute: Optional[bool] = field(
@@ -95,6 +97,8 @@ class ExecutorSettings(ExecutorSettingsBase):
             "help": "Whether to execute the workflow after deploying it and monitoring it by snakemake. By default "
             "the suite is only build and deployed if the ecflow-deploy arg is given.",
             "required": False,
+            "parse_func": lambda x: x.lower() in ("true", "1", "yes"),
+            "unparse_func": lambda x: "true" if x else "false",
         },
     )
 

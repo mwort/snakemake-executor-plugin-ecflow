@@ -1,26 +1,42 @@
-import datetime
+import datetime as dt
+import pyflow as pf
 
-today = datetime.date.today()
-parameters = {
-    "t2m": 167,
-    "tp": 228228,
-}
-fc_steps = range(0, 18 + 6, 6)
+end = dt.date.today() if config["date"] == "today" else dt.date.fromisoformat(config["date"])
+start = end - dt.timedelta(days=config["n_past_days"] - 1)
+parameters = config["parameters"]
+fc_steps = range(0, config["fc_length"] + config["fc_freq"], config["fc_freq"])
 
 rule snakemake_ecflow_research_suite:
     input:
         "report.pdf"
 
-rule build_env:
-    output: "env_modules.txt"
+rule build_plotting_env:
+    #input: "plotting-env-requirements.txt"
+    output: directory("environments/plotting-env")
     group: "make/envs"
-    shell: "module list > {output}"
+    threads: 4
+    resources:
+        time="12:00:00",
+        total_tasks=2,
+        mem="4GB",
+    shell:
+        """
+        virtualenv {output}
+        source {output}/bin/activate
+        # pip install -r {input}
+        """
 
 rule report:
     input:
         figures=expand("{parameter}/{step}.png", parameter=parameters.keys(), step=fc_steps),
-        env=rules.build_env.output
+        env=rules.build_plotting_env.output
     output: "report.pdf"
+    params:
+        ecflow=dict(
+            labels=pf.Label("info", "Reset meter when complete"),
+            meters=pf.Meter("progress", 0, 100),
+            ARBITRARY_VARIABLE="value",
+        )
     shell: "convert {input.figures} -quality 100 {output}"
 
 
@@ -31,7 +47,7 @@ rule download_data:
         mars <<EOF
         retrieve,
             class=ai,
-            date={today - datetime.timedelta(days=6):%Y-%m-%d}/to/{today:%Y-%m-%d},
+            date={start:%Y-%m-%d}/to/{end:%Y-%m-%d},
             expver=1,
             levtype=sfc,
             model=aifs-single,
