@@ -295,7 +295,7 @@ class Executor(RemoteExecutor):
             "_cores": "cpus_per_task",
             "runtime": "time",
             "cpus": "cpus_per_task",
-            "tmpdir": "tmpdir",
+            #"tmpdir": "tmpdir",
         }
         resources = {v: job.resources.get(k) for k, v in accepted_resources.items()}
         return {k: v for k, v in resources.items() if v is not None}
