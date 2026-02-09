@@ -277,12 +277,16 @@ class Executor(RemoteExecutor):
 
     def create_wildcard_families(
             self, job: JobExecutorInterface, parent: pf.AnchorFamily) -> pf.AnchorFamily:
-        fname = pf.ecflow_name(job.rule.name)
-        try:
-            family = parent.find_node(fname)
-        except KeyError:
-            with parent:
-                family = pf.AnchorFamily(fname)
+        # take all wildcards except the last one
+        wc = [k+"_"+v for k, v in list(job.wildcards_dict.items())][:-1]
+        for n in [job.rule.name] + wc:
+            fname = pf.ecflow_name(n)
+            try:
+                family = parent.find_node(fname)
+            except KeyError:
+                with parent:
+                    family = pf.AnchorFamily(fname)
+            parent = family
         return family
 
     def translate_resources(self, job: JobExecutorInterface) -> dict:
