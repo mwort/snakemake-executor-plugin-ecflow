@@ -295,14 +295,22 @@ class Executor(RemoteExecutor):
             # sm job.resources keys to troika resources
             "time": "time",
             "mem": "memory_per_cpu",
+            "mem_mb": "memory_per_cpu",
             "total_tasks": "total_tasks",
             "_cores": "cpus_per_task",
             "runtime": "time",
             "cpus": "cpus_per_task",
+            "_nodes": "total_nodes",
+            "nodes": "total_nodes",
+            "ntasks": "ntasks",
+            "tasks": "ntasks",
             #"tmpdir": "tmpdir",
         }
-        resources = {v: job.resources.get(k) for k, v in accepted_resources.items()}
-        return {k: v for k, v in resources.items() if v is not None}
+        resources = {}
+        for k, v in job.resources.items():
+            if k in accepted_resources and job.resources.get(k) is not None:
+                resources[accepted_resources[k]] = v
+        return resources
 
     def job_script(self, job, order=None) -> str:
         """Return the script to run for a job."""
