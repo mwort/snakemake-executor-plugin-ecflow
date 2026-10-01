@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Generator, Optional
@@ -12,10 +13,26 @@ from snakemake_interface_common.exceptions import WorkflowError  # noqa
 import pyflow as pf
 
 
+def ecflow_name(name: str) -> str:
+    """Make a string safe to use as an ecFlow node name.
+
+    pf.ecflow_name only replaces "-", " " and "/", but wildcard values may
+    contain anything, while ecFlow only accepts alphanumerics, "_" and "."
+    (the latter not as the first character).
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_.]", "_", str(name))
+    return "_" + cleaned[1:] if cleaned.startswith(".") else cleaned
+
+
 class Executor(RemoteExecutor):
 
     load_python = "module load python3"
     load_ecflow = "module load ecflow"
+
+    @property
+    def load_snakemake(self) -> str:
+        """Preamble for tasks that call snakemake, which loads this plugin."""
+        return f"{self.load_python}\n{self.load_ecflow}"
 
     @property
     def settings(self):
@@ -68,23 +85,26 @@ class Executor(RemoteExecutor):
 
     def create_suite(self):
         suite_name = self.settings.suite_name or self.workflow.default_target
+        # sm changes into the set workdir but doesnt store it in the workflow object
+        self.work_dir = restore_common_linked_dirs(self.workflow.workdir_init)
+        # str() because the settings parse these into Path, which pyflow rejects
+        self.deploy_dir = str(
+            self.settings.deploy_dir or f"{self.work_dir}/ecflow_suites/{suite_name}"
+        )
+        self.output_dir = str(self.settings.output_dir or f"{self.deploy_dir}/logs")
         host = pf.TroikaHost(
             "%HOST%",
             user="$USER",
             extra_variables={"HOST": f"%SCHOST:hpc%"},
             server_ecfvars=False,
+            # the suite out= arg is deprecated and clashes with the ECF_OUT the
+            # host defines itself (pyflow >= 3.5)
+            log_directory=self.output_dir,
         )
-        # sm changes into the set workdir but doesnt store it in the workflow object
-        self.work_dir = restore_common_linked_dirs(self.workflow.workdir_init)
-        self.deploy_dir = (
-            self.settings.deploy_dir or f"{self.work_dir}/ecflow_suites/{suite_name}"
-        )
-        self.output_dir = self.settings.output_dir or f"{self.deploy_dir}/logs"
         suite = pf.Suite(
             name=suite_name,
             host=host,
             files=self.deploy_dir,
-            out=self.output_dir,
             workdir=self.work_dir,
             defstatus=pf.state.suspended,
         )
@@ -98,8 +118,12 @@ class Executor(RemoteExecutor):
             families["make"] >> families["main"] >> families["clean"]
         return families
 
+    @property
+    def venv_dir(self) -> str:
+        """Environment the suite uses when it is not linked to the project."""
+        return f"{self.deploy_dir}/venv"
+
     def create_env_task(self):
-        self.venv_dir = f"{self.deploy_dir}/venv"
         script = dd(f"""
         {self.load_python}
         virtualenv {self.venv_dir}
@@ -115,10 +139,42 @@ class Executor(RemoteExecutor):
             )
         return env
 
+    def get_python_executable(self) -> str:
+        """Python the suite tasks call snakemake with.
+
+        Either the one this process runs in (linked) or the one the env task
+        builds in the deploy directory (unlinked).
+        """
+        if not self.settings.linked:
+            return f"{self.venv_dir}/bin/python"
+        return str(restore_common_linked_dirs(super().get_python_executable()))
+
+    def get_snakefile(self) -> str:
+        """Snakefile the suite tasks refer to, see get_python_executable."""
+        if not self.settings.linked:
+            return f"{self.deploy_dir}/Snakefile"
+        return str(restore_common_linked_dirs(self.snakefile))
+
+    def get_job_args(self, job: JobExecutorInterface, **kwargs) -> str:
+        """Skip RemoteExecutor's --wait-for-files.
+
+        Those point at this process' temporary directory, which is long gone
+        by the time the deployed suite runs the task.
+        """
+        return super(RemoteExecutor, self).get_job_args(job, **kwargs)
+
+    def additional_general_args(self) -> str:
+        """Repeat args that general_args() derives from the building process.
+
+        They are appended after general_args, so argparse lets them win.
+        """
+        if self.settings.linked:
+            return ""
+        # general_args points this at the venv snakemake is currently run from
+        return f"--scheduler-solver-path {self.venv_dir}/bin"
+
     def create_evaluate_task(self):
-        linked = self.settings.linked
-        python = self.get_python_executable() if linked else self.venv_dir + "/bin/python"
-        python = restore_common_linked_dirs(python)
+        python = self.get_python_executable()
         # make sure same settings are used as original setup
         ecfsets = {
             k: v for k, v in self.settings.get_items_by_category(None) if v is not None
@@ -129,7 +185,7 @@ class Executor(RemoteExecutor):
         ecfsets_str = " \\\n    ".join(
             f"--ecflow-{k.replace('_', '-')} {v}" for k, v in ecfsets.items()
         )
-        snakefile = self.snakefile if linked else self.deploy_dir + "/Snakefile"
+        snakefile = self.get_snakefile()
         script = dd(f"""
         {self.load_python}
         {self.load_ecflow}
@@ -212,7 +268,7 @@ class Executor(RemoteExecutor):
         wcname = "_".join([f"{k}_{v}" for k, v in wildcards.items()])
         name = job.name + ("_" + wcname if wcname else "")
         # rules without wildcards will be empty here, so we use the rule name
-        name_cleaned = pf.ecflow_name(name)
+        name_cleaned = ecflow_name(name)
         needsrun = any(j.dag.needrun(j) for j in jobs)
         variables = {k.upper(): v for k, v in wildcards.items()}
 
@@ -260,13 +316,13 @@ class Executor(RemoteExecutor):
         parts = group.split("/")
         # first check if any of the standard families match
         try:
-            parent = family = self.suite.find_node(pf.ecflow_name(parts[0]))
+            parent = family = self.suite.find_node(ecflow_name(parts[0]))
             parts = parts[1:]
         except KeyError:
             pass
 
         for sf in parts:
-            sf = pf.ecflow_name(sf)
+            sf = ecflow_name(sf)
             try:
                 family = parent.find_node(sf)
             except KeyError:
@@ -280,7 +336,7 @@ class Executor(RemoteExecutor):
         # take all wildcards except the last one
         wc = [k+"_"+v for k, v in list(job.wildcards_dict.items())][:-1]
         for n in [job.rule.name] + wc:
-            fname = pf.ecflow_name(n)
+            fname = ecflow_name(n)
             try:
                 family = parent.find_node(fname)
             except KeyError:
@@ -323,10 +379,22 @@ class Executor(RemoteExecutor):
         if dirs:
             lines.append(f"mkdir -p {dirs}")
 
-        lines.append(job.shellcmd)
+        lines.append(self.job_command(job))
         lines.append(self.io_check_script(job, order=order))
 
         return "\n\n".join(lines)
+
+    def job_command(self, job: JobExecutorInterface) -> str:
+        """Return the command that produces the output of a single job.
+
+        Rules with a shell directive are inlined into the task script. Anything
+        else (run:, script:, notebook:, wrapper: or a rule without any code,
+        e.g. touch() output) needs the snakemake runtime, so the task calls
+        snakemake back for exactly this job instead.
+        """
+        if job.shellcmd is not None:
+            return job.shellcmd
+        return f"{self.load_snakemake}\n\n{self.format_job_exec(job)}"
 
     def io_check_script(self, job: JobExecutorInterface, order=None) -> str:
         ostr = f"_{order}" if order is not None else ""
