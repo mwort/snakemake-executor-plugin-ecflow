@@ -129,7 +129,7 @@ class Executor(RemoteExecutor):
         virtualenv {self.venv_dir}
         source {self.venv_dir}/bin/activate
         pip install snakemake
-        pip install git+https://github.com/mwort/snakemake-executor-plugin-ecflow.git
+        pip install {self.settings.plugin_source}
         """)
         with self.families["make"]:
             env = pf.Task(

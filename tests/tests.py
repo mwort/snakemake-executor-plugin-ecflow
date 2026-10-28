@@ -107,6 +107,10 @@ class TestDeployUnlinked(TestWorkflowsBase):
             execute=False,
             linked=False,
             deploy="suite",
+            # The suite builds its own environment, so without this it would
+            # install the published plugin and the tasks would run code that has
+            # nothing to do with the tree under test.
+            plugin_source=str(Path(__file__).parent.parent),
         )
 
     @handle_testcase

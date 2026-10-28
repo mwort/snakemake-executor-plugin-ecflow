@@ -74,6 +74,14 @@ class ExecutorSettings(ExecutorSettingsBase):
             "help": "ECflow server to upload the suite to. Exisiting suites will be replaced.",
         },
     )
+    plugin_source: Optional[str] = field(
+        default="git+https://github.com/mwort/snakemake-executor-plugin-ecflow.git",
+        metadata={
+            "help": "What the unlinked setup task pip-installs this plugin from. "
+                    "Point it at a local checkout to run a suite, or the tests, "
+                    "against uncommitted changes instead of the published version.",
+        },
+    )
     output_def_file: Optional[str] = field(
         default=None,
         metadata={
