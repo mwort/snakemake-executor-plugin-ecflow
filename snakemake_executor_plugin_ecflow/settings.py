@@ -65,7 +65,16 @@ class ExecutorSettings(ExecutorSettingsBase):
     deploy: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Whether to deploy the suite (--deploy=suite) or parts of it (e.g. --deploy=rule/job).",
+            "help": "Whether to deploy the suite (--deploy=suite) or parts of it "
+                    "(e.g. --deploy=rule/job, or several separated by commas).",
+        },
+    )
+    deploy_downstream: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Deploy only what lies downstream of this rule, instead of naming "
+                    "nodes with --deploy. Checkpoint tasks use this to re-expand their "
+                    "own part of the suite without touching the rest of it.",
         },
     )
     host: Optional[str] = field(

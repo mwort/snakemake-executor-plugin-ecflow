@@ -3,13 +3,15 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import List, Generator, Optional
+from typing import List, Generator
 from textwrap import dedent as dd
 
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_interface_common.exceptions import WorkflowError  # noqa
+from snakemake.io import is_flagged
+from pyflow.importer import ecflow  # finds the bindings for this python via $ECFLOW_DIR
 import pyflow as pf
 
 
@@ -22,6 +24,18 @@ def ecflow_name(name: str) -> str:
     """
     cleaned = re.sub(r"[^A-Za-z0-9_.]", "_", str(name))
     return "_" + cleaned[1:] if cleaned.startswith(".") else cleaned
+
+
+class TokenInLimit(pf.InLimit):
+    """An inlimit taking several tokens, which pf.InLimit cannot express."""
+
+    def __init__(self, limit: pf.Limit, tokens: int = 1):
+        super().__init__(limit)
+        self.tokens = tokens
+
+    def _build(self, ecflow_parent):
+        path, name = self.value.fullname.split(":")
+        ecflow_parent.add_inlimit(ecflow.InLimit(name, path, self.tokens))
 
 
 class Executor(RemoteExecutor):
@@ -115,7 +129,9 @@ class Executor(RemoteExecutor):
         with self.suite:
             for f in ["make", "admin", "main", "clean"]:
                 families[f] = pf.AnchorFamily(f)
-            families["make"] >> families["main"] >> families["clean"]
+            # clean holds the temp() cleanup tasks, which run alongside main
+            families["make"] >> families["main"]
+            families["make"] >> families["clean"]
         return families
 
     @property
@@ -173,33 +189,57 @@ class Executor(RemoteExecutor):
         # general_args points this at the venv snakemake is currently run from
         return f"--scheduler-solver-path {self.venv_dir}/bin"
 
-    def create_evaluate_task(self):
-        python = self.get_python_executable()
+    @property
+    def suite_targets(self) -> str:
+        """The targets the suite was built for, as snakemake was asked for them.
+
+        Not workflow.default_target: a suite built for `monthly` must rebuild
+        itself for `monthly`, not for whatever rule happens to come first in
+        the Snakefile. Falls back to the default target if the settings object
+        ever stops carrying them.
+        """
+        settings = getattr(self.workflow, "dag_settings", None)
+        targets = sorted(getattr(settings, "targets", None) or [])
+        return " ".join(targets) or self.workflow.default_target
+
+    def rebuild_command(self, target: str, **overrides) -> str:
+        """A snakemake call that rebuilds the suite with this run's settings.
+
+        Used by the evaluate task and by every checkpoint, which has to
+        re-expand its own part of the DAG once it knows its output. Settings
+        given here override the ones this process was invoked with; pass None
+        to drop one.
+        """
         # make sure same settings are used as original setup
         ecfsets = {
             k: v for k, v in self.settings.get_items_by_category(None) if v is not None
         }
-        ecfsets["deploy"] = "main"
         ecfsets.pop("execute", None)
         ecfsets.pop("linked", None)
-        ecfsets_str = " \\\n    ".join(
-            f"--ecflow-{k.replace('_', '-')} {v}" for k, v in ecfsets.items()
-        )
-        snakefile = self.get_snakefile()
+        ecfsets.update(overrides)
+        parts = [
+            f"{self.get_python_executable()} -m snakemake"
+            f" -s {self.get_snakefile()} -j 1 --executor ecflow"
+        ]
+        parts += [
+            f"--ecflow-{k.replace('_', '-')} {v}"
+            for k, v in ecfsets.items()
+            if v is not None
+        ]
+        parts.append(target)
+        return " \\\n    ".join(parts) + "\n"
+
+    def create_evaluate_task(self):
         script = dd(f"""
         {self.load_python}
         {self.load_ecflow}
-
-        {python} -m snakemake -s {snakefile} -j 1 --executor ecflow \\
-            {ecfsets_str} \\
-            $TARGET
-        """)
+        """) + self.rebuild_command("$TARGET", deploy="main", deploy_downstream=None)
         with self.families["admin"]:
             evaluate = pf.Task(
                 name="evaluate",
                 script=script,
                 defstatus=pf.state.complete,
-                TARGET=self.workflow.default_target,
+                TARGET=self.suite_targets,
             )
         return evaluate
 
@@ -213,20 +253,212 @@ class Executor(RemoteExecutor):
         tasks = {}
         dag = self.workflow.dag
         self.jobs_and_groups, self.jobs, self.groups = self.get_jobs_and_groups()
-        # global task limit attached to the admin family
-        tlimit = pf.Limit("task_limit", self.workflow.nodes)
-        self.families["admin"].limits = tlimit
+        # global task limit and one limit per --resources entry (other than
+        # snakemake's own _cores/_nodes), attached to the admin family
+        with self.families["admin"]:
+            self.task_limit = pf.Limit("task_limit", self.workflow.nodes)
+            self.resource_limits = {
+                name: pf.Limit(ecflow_name(name), int(value))
+                for name, value in self.workflow.global_resources.items()
+                if not name.startswith("_") and value is not None
+            }
         # create tasks first
         for job in self.jobs_and_groups:
-            self.families[job], tasks[job] = self.create_task(job, inlimits=tlimit)
+            self.families[job], tasks[job] = self.create_task(job)
         # assign triggers
         for job, task in tasks.items():
             deps = dag.dependencies[job]
             if deps:
-                triggers = list({tasks[self.groups[j] if j.group else j] for j in deps})
-                triggers = pf.all_complete(triggers) if len(triggers) > 1 else triggers
-                task.triggers = triggers
+                nodes = {tasks[self.groups[j] if j.group else j] for j in deps}
+                task.triggers = self.build_trigger(nodes)
+        self.cleanup_tasks = self.create_cleanup_tasks(tasks)
         return tasks
+
+    def inlimits(self, jobs: list) -> list:
+        """The task limit plus a limit per resource the jobs request, taking as
+        many tokens as the most demanding job, as snakemake would."""
+        limits = [self.task_limit]
+        for name, limit in self.resource_limits.items():
+            tokens = max((j.resources.get(name) or 0 for j in jobs), default=0)
+            if tokens:
+                limits.append(TokenInLimit(limit, int(tokens)))
+        return limits
+
+    @staticmethod
+    def temp_outputs(job: JobExecutorInterface) -> list:
+        return [f for f in job.output if is_flagged(f, "temp")]
+
+    def create_cleanup_tasks(self, tasks: dict) -> dict:
+        """job -> task removing the job's temp() outputs once every task
+        consuming them is complete.
+
+        The inlined shell scripts bypass snakemake, which would otherwise
+        delete temp files after their last consumer. The cleanup task goes in
+        the job's family path under clean/ rather than main/, so a trigger on a
+        family in main does not wait for the cleanup (which waits for it).
+        """
+        dag = self.workflow.dag
+        cleanup = {}
+        for job, task in tasks.items():
+            jobs = sorted(job.jobs, key=lambda x: self.jobs.index(x)) if job.is_group() else [job]
+            temp = [f for j in jobs for f in self.temp_outputs(j)]
+            # target rules without output (e.g. all) get no task
+            keys = {self.groups[c] if c.group else c for j in jobs for c in dag.depending[j]}
+            consumers = {tasks[k] for k in keys if k in tasks}
+            consumers.discard(task)
+            if not temp or not consumers:
+                continue
+            with self.create_job_family(job, self.families["clean"]):
+                cleanup[job] = pf.Task(
+                    name=task.name + "_cleanup",
+                    script="rm -rf " + " ".join(temp),
+                    triggers=self.build_trigger(consumers),
+                    # also when the producer is done but its temp files are still there
+                    defstatus=pf.state.queued
+                    if any(dag.needrun(j) for j in jobs) or any(os.path.exists(f) for f in temp)
+                    else pf.state.complete,
+                )
+        return cleanup
+
+    @staticmethod
+    def and_all(nodes: list):
+        """AND nodes together as a balanced tree rather than a chain.
+
+        pf.all_complete reduces left to right, so n dependencies nest n deep
+        and pyflow's simplify() recurses once per level. A fan-in of a few
+        thousand jobs then dies on Python's recursion limit. Pairing them up
+        makes the nesting log2(n) instead.
+        """
+        if not nodes:
+            raise ValueError("cannot wait on an empty list of nodes")
+        while len(nodes) > 1:
+            nodes = [
+                nodes[i] & nodes[i + 1] if i + 1 < len(nodes) else nodes[i]
+                for i in range(0, len(nodes), 2)
+            ]
+        return nodes[0]
+
+    @property
+    def family_sizes(self) -> dict:
+        """id(family) -> number of tasks under it, for the whole suite.
+
+        Keyed on id() rather than on the node: pyflow overloads == to build
+        trigger expressions, so a dict keyed on nodes would match on any hash
+        collision.
+        """
+        if not hasattr(self, "_family_sizes"):
+            sizes = {}
+
+            def walk(node) -> int:
+                if isinstance(node, pf.Task):
+                    return 1
+                if not hasattr(node, "executable_children"):
+                    return 0  # a label, variable or limit
+                n = sum(walk(c) for c in node.executable_children)
+                sizes[id(node)] = n
+                return n
+
+            for root in self.suite.executable_children:
+                walk(root)
+            self._family_sizes = sizes
+        return self._family_sizes
+
+    def cover_nodes(self, nodes: set) -> list:
+        """The smallest set of nodes covering exactly the given tasks.
+
+        A family whose every task is in the set stands in for those tasks, so a
+        dependency on all of a rule's jobs, or on all of one wildcard's, becomes
+        a single family. Triggers and partial deployment both want this: waiting
+        on, or replacing, one family beats naming its several thousand tasks.
+
+        Counted upwards from the given tasks rather than by walking the suite,
+        which would be quadratic over the whole DAG.
+        """
+        sizes = self.family_sizes
+        covered = {}
+        for task in nodes:
+            parent = getattr(task, "parent", None)
+            while parent is not None and id(parent) in sizes:
+                covered[id(parent)] = covered.get(id(parent), 0) + 1
+                parent = getattr(parent, "parent", None)
+
+        keep, seen = [], set()
+        for task in nodes:
+            best, parent = task, getattr(task, "parent", None)
+            # climb while the whole family is wanted; the suite is not in sizes,
+            # so this stops below it
+            while (parent is not None and id(parent) in sizes
+                   and covered.get(id(parent)) == sizes[id(parent)]):
+                best = parent
+                parent = getattr(parent, "parent", None)
+            if id(best) not in seen:
+                seen.add(id(best))
+                keep.append(best)
+        keep.sort(key=lambda n: n.fullname)
+        return keep
+
+    def build_trigger(self, nodes: set):
+        """Trigger expression for a set of dependency tasks."""
+        keep = self.cover_nodes(nodes)
+        return keep[0] if len(keep) == 1 else self.and_all(keep)
+
+    def downstream_jobs(self, rule: str) -> set:
+        """Every job that depends, directly or not, on a job of this rule.
+
+        The rule's own jobs are excluded: a checkpoint must not replace the
+        family holding the task that is doing the replacing.
+        """
+        dag = self.workflow.dag
+        seen, frontier = set(), [j for j in dag.jobs if j.rule.name == rule]
+        if not frontier:
+            raise WorkflowError(f"no job of rule {rule} is in the DAG")
+        own = set(frontier)
+        while frontier:
+            job = frontier.pop()
+            for dep in dag.depending[job]:
+                if dep not in seen:
+                    seen.add(dep)
+                    frontier.append(dep)
+        return seen - own
+
+    def downstream_nodes(self, rule: str) -> list:
+        """The nodes to replace so that one rule's dependents are rebuilt."""
+        jobs = self.downstream_jobs(rule)
+        tasks = set()
+        for job in jobs:
+            key = self.groups[job] if job.group else job
+            if key in self.tasks:
+                tasks.add(self.tasks[key])
+            if key in self.cleanup_tasks:
+                tasks.add(self.cleanup_tasks[key])
+        if not tasks:
+            return []
+        return self.cover_nodes(tasks)
+
+    def checkpoint_rules(self) -> list:
+        """Names of the checkpoint rules with a job in the DAG."""
+        seen = []
+        for job in self.workflow.dag.jobs:
+            if getattr(job.rule, "is_checkpoint", False) and job.rule.name not in seen:
+                seen.append(job.rule.name)
+        return seen
+
+    def checkpoint_rebuild_script(self, rule: str) -> str:
+        """Tail appended to a checkpoint task, re-expanding its own subtree.
+
+        A checkpoint's dependents cannot be enumerated until it has run, so the
+        suite is built without them and the task calls snakemake back once its
+        output exists. Only the nodes downstream of this rule are replaced, so
+        the rest of the suite -- including the family this task is running in --
+        is left alone.
+        """
+        return dd(f"""
+        # --- re-expand the part of the suite that depends on this checkpoint
+        {self.load_python}
+        {self.load_ecflow}
+        """) + self.rebuild_command(
+            self.suite_targets, deploy=None, deploy_downstream=rule
+        )
 
     def get_jobs_and_groups(self):
         # groups in SM are based on jobs that need to run, here we want groups
@@ -284,8 +516,16 @@ class Executor(RemoteExecutor):
             script = self.job_script(job)
             ecflow_params = getattr(job.params, "ecflow", {})
 
+        # A checkpoint only learns its dependents once it has run, so it
+        # re-expands its own part of the suite before reporting complete.
+        checkpoints = [j.rule.name for j in jobs
+                       if getattr(j.rule, "is_checkpoint", False)]
+        for rule in dict.fromkeys(checkpoints):
+            script += "\n\n" + self.checkpoint_rebuild_script(rule)
+
         kwargs.update(variables)
         kwargs.update(ecflow_params)
+        kwargs["inlimits"] = self.inlimits(jobs)
 
         # take the max of resources for all jobs
         sargs = [self.translate_resources(j) for j in jobs]
@@ -302,24 +542,31 @@ class Executor(RemoteExecutor):
             )
         return family, task
 
-    def create_job_family(self, job: JobExecutorInterface) -> pf.AnchorFamily:
+    def create_job_family(
+            self, job: JobExecutorInterface, parent: pf.AnchorFamily = None) -> pf.AnchorFamily:
+        """The job's family under main, or the same family path under another
+        parent (where rules without wildcards get a family of their own)."""
         main = self.families["main"]
+        parent = main if parent is None else parent
         if job.is_group():
-            family = self.create_group_families(job.groupid, main)
-        elif job.wildcards:
-            family = self.create_wildcard_families(job, main)
+            family = self.create_group_families(job.groupid, parent, standard=parent is main)
+        elif job.wildcards or parent is not main:
+            family = self.create_wildcard_families(job, parent)
         else:
             family = main
         return family
 
-    def create_group_families(self, group: str, parent: pf.AnchorFamily) -> pf.AnchorFamily:
+    def create_group_families(
+            self, group: str, parent: pf.AnchorFamily, standard: bool = True) -> pf.AnchorFamily:
         parts = group.split("/")
+        family = parent
         # first check if any of the standard families match
-        try:
-            parent = family = self.suite.find_node(ecflow_name(parts[0]))
-            parts = parts[1:]
-        except KeyError:
-            pass
+        if standard:
+            try:
+                parent = family = self.suite.find_node(ecflow_name(parts[0]))
+                parts = parts[1:]
+            except KeyError:
+                pass
 
         for sf in parts:
             sf = ecflow_name(sf)
@@ -368,33 +615,48 @@ class Executor(RemoteExecutor):
                 resources[accepted_resources[k]] = v
         return resources
 
-    def job_script(self, job, order=None) -> str:
-        """Return the script to run for a job."""
-        lines = []
-
-        if job.env_modules:
-            lines.append(job.env_modules.shellcmd(""))
-
-        dirs = " ".join([d for d in map(os.path.dirname, job.output) if d])
-        if dirs:
-            lines.append(f"mkdir -p {dirs}")
-
-        lines.append(self.job_command(job))
-        lines.append(self.io_check_script(job, order=order))
-
-        return "\n\n".join(lines)
-
-    def job_command(self, job: JobExecutorInterface) -> str:
-        """Return the command that produces the output of a single job.
+    def job_script(self, job: JobExecutorInterface, order=None) -> str:
+        """Return the script to run for a job.
 
         Rules with a shell directive are inlined into the task script. Anything
         else (run:, script:, notebook:, wrapper: or a rule without any code,
         e.g. touch() output) needs the snakemake runtime, so the task calls
         snakemake back for exactly this job instead.
         """
-        if job.shellcmd is not None:
-            return job.shellcmd
-        return f"{self.load_snakemake}\n\n{self.format_job_exec(job)}"
+        if job.shellcmd is None:
+            return f"{self.load_snakemake}\n\n{self.format_job_exec(job)}"
+
+        lines = []
+
+        if job.env_modules:
+            lines.append(job.env_modules.shellcmd(""))
+
+        if len(job.output) > 0:
+            lines.append(f"rm -rf $OUTPUT")
+
+        # snakemake creates the directories of outputs and logs before a job
+        dirs = " ".join(sorted({d for d in map(os.path.dirname, [*job.output, *job.log]) if d}))
+        if dirs:
+            lines.append(f"mkdir -p {dirs}")
+
+        # like snakemake, remove the outputs of a failed job, so a partial
+        # output (e.g. a directory created before the command failed) is not
+        # taken as done when the suite is rebuilt
+        ostr = f"_{order}" if order is not None else ""
+        if len(job.output) > 0:
+            lines.append(f"trap 'rm -rf $OUTPUT{ostr}' ERR")
+        lines.append(job.shellcmd)
+        if len(job.output) > 0:
+            lines.append("trap - ERR")
+
+        # and touches touch() outputs after it
+        touch = [f for f in job.output if is_flagged(f, "touch")]
+        if touch:
+            lines.append("touch " + " ".join(touch))
+        lines.append(self.io_check_script(job, order=order))
+
+        return "\n\n".join(lines)
+
 
     def io_check_script(self, job: JobExecutorInterface, order=None) -> str:
         ostr = f"_{order}" if order is not None else ""
@@ -411,6 +673,7 @@ class Executor(RemoteExecutor):
         if [[ ! $n_missing -eq 0 || ! $n_outdated -eq 0 ]]; then
             [[ ! $n_missing -eq 0 ]] && echo $n_missing " files or directories are missing."
             {'[[ ! $n_outdated -eq 0 ]] && echo $n_outdated " files or directories are outdated."' if has_i else ''}
+            rm -rf $OUTPUT{ostr}
             exit 1
         fi
         """)
@@ -430,15 +693,41 @@ class Executor(RemoteExecutor):
             )
         return clean
 
+    def node_path(self, node) -> str:
+        """Suite-relative path of a node, the form find_node expects."""
+        prefix = f"/{self.suite.name}/"
+        name = node.fullname
+        return name[len(prefix):] if name.startswith(prefix) else name
+
+    @property
+    def deploy_nodes(self) -> list:
+        """The nodes to deploy scripts for and replace on the server.
+
+        Either named with --ecflow-deploy or, for a checkpoint re-expanding
+        itself, derived from --ecflow-deploy-downstream.
+        """
+        if self.settings.deploy_downstream:
+            return self.downstream_nodes(self.settings.deploy_downstream)
+        deploy = self.settings.deploy
+        if not deploy:
+            return []
+        if deploy == "suite":
+            return [self.suite]
+        return [self.suite.find_node(n.strip()) for n in deploy.split(",")]
+
     def deploy(self):
         print("Checking suite definition...")
         self.suite.check_definition()
         if self.settings.output_def_file is not None:
             self.write_def_file()
-        if self.settings.deploy:
-            self.deploy_scripts()
-        if self.settings.host and self.settings.deploy is not None:
-            self.upload_suite()
+        nodes = self.deploy_nodes
+        if not nodes:
+            if self.settings.deploy_downstream:
+                print(f"Nothing downstream of {self.settings.deploy_downstream}.")
+            return
+        self.deploy_scripts(nodes)
+        if self.settings.host:
+            self.upload_suite(nodes)
 
     def write_def_file(self):
         print("Writing definition file...")
@@ -446,30 +735,49 @@ class Executor(RemoteExecutor):
         suite_def.check()
         suite_def.save_as_defs(self.settings.output_def_file)
 
-    def deploy_scripts(self):
-        deploy = self.settings.deploy
-        node = deploy if deploy != "suite" else None
-        print(f"Deploying {deploy}...")
-        self.suite.deploy_suite(node=node)
+    def deploy_scripts(self, nodes: list):
+        """Write out the scripts of exactly the tasks under the given nodes.
+
+        Suite.deploy_suite only takes one node and walks its all_tasks, which a
+        Task does not have, so deploying a single task would mean falling back
+        to its whole family -- for a task sitting directly in main that is the
+        entire suite, redeployed on every checkpoint. This does the same work
+        per node instead.
+        """
+        from pyflow.deployment import FileSystem
+
+        target = FileSystem(self.suite)
+        tasks, families = {}, {}
+        for node in nodes:
+            if isinstance(node, pf.Task):
+                tasks[id(node)] = node
+            else:
+                tasks.update({id(t): t for t in node.all_tasks})
+                families.update({id(f): f for f in node.all_families})
+        for task in tasks.values():
+            script, includes = task.generate_script()
+            target.deploy_task(task.deploy_path, script, includes)
+        for family in families.values():
+            manual = self.suite.generate_stub(family.manual)
+            if manual:
+                target.deploy_manual(family.manual_path, manual)
+        target.deploy_headers()
+        print(f"Deployed {len(tasks)} task scripts.")
         if not self.settings.linked:
             print("Copying Snakefile to deploy directory...")
             shutil.copy(self.snakefile, self.deploy_dir + "/Snakefile")
 
-    def upload_suite(self, deploy: Optional[str] = None):
-        """Upload the suite to the ecFlow server."""
-        suite, deploy, ecf_host = self.suite, self.settings.deploy, self.settings.host
+    def upload_suite(self, nodes: list):
+        """Replace the given nodes on the ecFlow server."""
+        ecf_host = self.settings.host
         print("Uploading to server...")
-        if deploy != "suite":
-            replace_family = suite.find_node(deploy)
-            assert hasattr(
-                replace_family, "replace_on_server"
-            ), f"Is {replace_family} really a family?"
-        else:
-            replace_family = suite
-        print(f"Replace {replace_family.fullname} on {ecf_host}...")
-        replace_family.replace_on_server(ecf_host, 3141)
-        # begin suite if not already done
-        if deploy == "suite" and self.ecflow_state(suite) == "unknown":
+        for node in nodes:
+            print(f"Replace {node.fullname} on {ecf_host}...")
+            node.replace_on_server(ecf_host, 3141)
+        # begin suite if not already done. Identity, not `in`: pyflow nodes
+        # overload == to build trigger expressions, so `node in list` is always
+        # truthy.
+        if any(n is self.suite for n in nodes) and self.ecflow_state(self.suite) == "unknown":
             self.ecflow_client.begin_suite("/" + self.suite.name)
         return
 
