@@ -1,0 +1,19 @@
+rule all:
+    input:
+        expand("final.{sample}.out", sample=[1, 2])
+
+
+rule make_temp:
+    output:
+        temp("temp.{sample}.out")
+    shell:
+        "echo {wildcards.sample} > {output}"
+
+
+rule use_temp:
+    input:
+        "temp.{sample}.out"
+    output:
+        "final.{sample}.out"
+    shell:
+        "cat {input} > {output}"

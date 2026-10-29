@@ -1,0 +1,38 @@
+import os
+
+
+rule all:
+    input:
+        "aggregated.out"
+
+
+# the number of files is only known once this has run
+checkpoint split:
+    output:
+        directory("split")
+    shell:
+        "mkdir -p {output} && for i in 1 2 3; do echo $i > {output}/$i.out; done"
+
+
+rule process:
+    input:
+        "split/{i}.out"
+    output:
+        "processed/{i}.out"
+    shell:
+        "cat {input} > {output}"
+
+
+def aggregate_input(wildcards):
+    split = checkpoints.split.get().output[0]
+    ids = glob_wildcards(os.path.join(split, "{i}.out")).i
+    return expand("processed/{i}.out", i=sorted(ids))
+
+
+rule aggregate:
+    input:
+        aggregate_input
+    output:
+        "aggregated.out"
+    shell:
+        "cat {input} > {output}"

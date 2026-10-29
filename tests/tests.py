@@ -67,15 +67,12 @@ class TestWorkflowsBase(TestWorkflowsLocalStorageBase):
         if wait:
             self.wait(node)
 
-    def add_testcase(self, name, source=None):
-        from snakemake.common.tests import testcases
-        # this is a workaround to copy a local test case because the
-        # snakemake.common.tests.__init__.py:TestWorkflowsBase.run_workflow doesnt
-        # allow to pass custom test cases
-        testcase = Path(__file__).parent / (source or f"{name}_testcase")
-        destination = Path(testcases.__file__).parent / name
-        shutil.rmtree(destination, ignore_errors=True)
-        shutil.copytree(testcase, destination, dirs_exist_ok=True)
+    def _copy_test_files(self, test_path, tmp_path):
+        # snakemake's run_workflow only knows its own testcases, so a local
+        # tests/<name>_testcase takes precedence. Copied straight into the
+        # test's tmp dir, so parallel workers (pytest -n) share nothing.
+        local = Path(__file__).parent / f"{test_path.name}_testcase"
+        shutil.copytree(local if local.is_dir() else test_path, tmp_path)
 
     def wait(self, node, timeout=900):
         node_path = f"/{self.ecflow_suite_name}/{node}"
@@ -171,7 +168,6 @@ class TestCustomSnakefile(TestWorkflowsBase):
 
     @handle_testcase
     def test_custom_workflow(self, tmp_path):
-        self.add_testcase("custom", source="custom_testcase")
         with pytest.raises(SystemExit) as excinfo:
             self.run_workflow("custom", tmp_path)
         assert excinfo.value.code == 0
@@ -184,7 +180,6 @@ class TestRunRules(TestWorkflowsBase):
 
     @handle_testcase
     def test_run_workflow(self, tmp_path):
-        self.add_testcase("run_rules")
         self.run_workflow("run_rules", tmp_path)
         self.run_task("admin/evaluate", wait=True)
 
@@ -217,7 +212,6 @@ class TestDeployedSuite(TestWorkflowsBase):
 
     def deploy_and_run(self, name, tmp_path) -> Path:
         """Deploy a local testcase, run the suite and return its workdir."""
-        self.add_testcase(name)
         with pytest.raises(SystemExit) as excinfo:
             self.run_workflow(name, tmp_path)
         assert excinfo.value.code == 0
@@ -228,7 +222,6 @@ class TestDeployedSuite(TestWorkflowsBase):
     @handle_testcase
     def test_temp_workflow(self, tmp_path):
         workdir = Path(tmp_path) / "temp"
-        self.add_testcase("temp")
         with pytest.raises(SystemExit):
             self.run_workflow("temp", tmp_path)
         definition = (workdir / self.def_file).read_text()

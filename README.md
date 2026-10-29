@@ -20,6 +20,10 @@ All tests:
 ```
 pytest -s tests/tests.py
 ```
+In parallel (each test deploys its own suite, so they only wait on ecFlow):
+```
+pytest -n 8 tests/tests.py
+```
 Individual tests:
 ```
 pytest -s tests/tests.py::TestCustomSnakefile

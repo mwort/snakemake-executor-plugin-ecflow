@@ -1,0 +1,31 @@
+# run with --resources gpu=2
+rule all:
+    input:
+        expand("small.{sample}.out", sample=[1, 2]),
+        "big.out",
+        "free.out",
+
+
+rule small:
+    output:
+        "small.{sample}.out"
+    resources:
+        gpu=1
+    shell:
+        "touch {output}"
+
+
+rule big:
+    output:
+        "big.out"
+    resources:
+        gpu=2
+    shell:
+        "touch {output}"
+
+
+rule free:
+    output:
+        "free.out"
+    shell:
+        "touch {output}"

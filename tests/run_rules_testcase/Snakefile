@@ -1,0 +1,27 @@
+rule all:
+    input:
+        "combined.out"
+
+
+rule run_rule:
+    output:
+        "run.out"
+    run:
+        with open(output[0], "w") as f:
+            f.write("written by run\n")
+
+
+# no code at all, snakemake only touches the output
+rule touch_rule:
+    output:
+        touch("touched.out")
+
+
+rule combine:
+    input:
+        "run.out",
+        "touched.out",
+    output:
+        "combined.out"
+    shell:
+        "cat {input} > {output}"
