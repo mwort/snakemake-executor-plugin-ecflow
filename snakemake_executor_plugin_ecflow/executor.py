@@ -272,6 +272,7 @@ class Executor(RemoteExecutor):
                 nodes = {tasks[self.groups[j] if j.group else j] for j in deps}
                 task.triggers = self.build_trigger(nodes)
         self.cleanup_tasks = self.create_cleanup_tasks(tasks)
+        self.add_checkpoint_deploy_nodes(tasks)
         return tasks
 
     def inlimits(self, jobs: list) -> list:
@@ -421,16 +422,17 @@ class Executor(RemoteExecutor):
                     frontier.append(dep)
         return seen - own
 
-    def downstream_nodes(self, rule: str) -> list:
+    def downstream_nodes(self, rule: str, tasks: dict) -> list:
         """The nodes to replace so that one rule's dependents are rebuilt."""
         jobs = self.downstream_jobs(rule)
-        tasks = set()
+        nodes = set()
         for job in jobs:
             key = self.groups[job] if job.group else job
-            if key in self.tasks:
-                tasks.add(self.tasks[key])
+            if key in tasks:
+                nodes.add(tasks[key])
             if key in self.cleanup_tasks:
-                tasks.add(self.cleanup_tasks[key])
+                nodes.add(self.cleanup_tasks[key])
+        tasks = nodes
         if not tasks:
             return []
         return self.cover_nodes(tasks)
@@ -443,21 +445,42 @@ class Executor(RemoteExecutor):
                 seen.append(job.rule.name)
         return seen
 
+    def add_checkpoint_deploy_nodes(self, tasks: dict):
+        """Give each checkpoint task the nodes its rebuild has to replace.
+
+        Worked out here rather than in the rebuild: once a checkpoint's output
+        exists, snakemake resolves its dependents' input functions without it
+        and leaves the checkpoint out of the DAG, so only this build still
+        knows what depends on it.
+        """
+        for job, task in tasks.items():
+            jobs = job.jobs if job.is_group() else [job]
+            rules = dict.fromkeys(
+                j.rule.name for j in jobs if getattr(j.rule, "is_checkpoint", False)
+            )
+            if not rules:
+                continue
+            nodes = [n for rule in rules for n in self.downstream_nodes(rule, tasks)]
+            paths = dict.fromkeys(self.node_path(n) for n in nodes)
+            with task:
+                pf.Variable("CHECKPOINT_DEPLOY", ",".join(paths))
+
     def checkpoint_rebuild_script(self, rule: str) -> str:
         """Tail appended to a checkpoint task, re-expanding its own subtree.
 
         A checkpoint's dependents cannot be enumerated until it has run, so the
         suite is built without them and the task calls snakemake back once its
-        output exists. Only the nodes downstream of this rule are replaced, so
-        the rest of the suite -- including the family this task is running in --
-        is left alone.
+        output exists. Only the nodes that depended on this rule when the suite
+        was built ($CHECKPOINT_DEPLOY) and the tasks new to the server are
+        replaced, so the rest of the suite -- including the family this task is
+        running in -- is left alone.
         """
         return dd(f"""
         # --- re-expand the part of the suite that depends on this checkpoint
         {self.load_python}
         {self.load_ecflow}
         """) + self.rebuild_command(
-            self.suite_targets, deploy=None, deploy_downstream=rule
+            self.suite_targets, deploy='"$CHECKPOINT_DEPLOY"', deploy_downstream=rule
         )
 
     def get_jobs_and_groups(self):
@@ -631,8 +654,10 @@ class Executor(RemoteExecutor):
         if job.env_modules:
             lines.append(job.env_modules.shellcmd(""))
 
+        # group tasks number their variables, OUTPUT_0, OUTPUT_1, ...
+        ostr = f"_{order}" if order is not None else ""
         if len(job.output) > 0:
-            lines.append(f"rm -rf $OUTPUT")
+            lines.append(f"rm -rf $OUTPUT{ostr}")
 
         # snakemake creates the directories of outputs and logs before a job
         dirs = " ".join(sorted({d for d in map(os.path.dirname, [*job.output, *job.log]) if d}))
@@ -642,7 +667,6 @@ class Executor(RemoteExecutor):
         # like snakemake, remove the outputs of a failed job, so a partial
         # output (e.g. a directory created before the command failed) is not
         # taken as done when the suite is rebuilt
-        ostr = f"_{order}" if order is not None else ""
         if len(job.output) > 0:
             lines.append(f"trap 'rm -rf $OUTPUT{ostr}' ERR")
         lines.append(job.shellcmd)
@@ -703,17 +727,32 @@ class Executor(RemoteExecutor):
     def deploy_nodes(self) -> list:
         """The nodes to deploy scripts for and replace on the server.
 
-        Either named with --ecflow-deploy or, for a checkpoint re-expanding
-        itself, derived from --ecflow-deploy-downstream.
+        Named with --ecflow-deploy. A checkpoint re-expanding itself
+        (--ecflow-deploy-downstream) also adds the tasks the server does not
+        have yet, i.e. the jobs its output has just expanded to.
         """
-        if self.settings.deploy_downstream:
-            return self.downstream_nodes(self.settings.deploy_downstream)
-        deploy = self.settings.deploy
-        if not deploy:
-            return []
+        deploy = self.settings.deploy or ""
         if deploy == "suite":
             return [self.suite]
-        return [self.suite.find_node(n.strip()) for n in deploy.split(",")]
+        paths = [n.strip() for n in deploy.split(",") if n.strip()]
+        if not self.settings.deploy_downstream:
+            return [self.suite.find_node(p) for p in paths]
+        named = []
+        for path in paths:
+            try:
+                named.append(self.suite.find_node(path))
+            except KeyError:
+                print(f"{path} is no longer part of the suite, skipping it.")
+        # new nodes first, so the triggers of the replaced ones resolve
+        return self.new_nodes() + named
+
+    def new_nodes(self) -> list:
+        """Nodes covering the tasks that are not on the server yet."""
+        self.ecflow_client.sync_local()
+        defs = self.ecflow_client.get_defs()
+        tasks = [*self.tasks.values(), *self.cleanup_tasks.values()]
+        new = [t for t in tasks if defs.find_abs_node(t.fullname) is None]
+        return self.cover_nodes(new) if new else []
 
     def deploy(self):
         print("Checking suite definition...")

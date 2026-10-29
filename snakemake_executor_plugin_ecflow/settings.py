@@ -72,9 +72,10 @@ class ExecutorSettings(ExecutorSettingsBase):
     deploy_downstream: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Deploy only what lies downstream of this rule, instead of naming "
-                    "nodes with --deploy. Checkpoint tasks use this to re-expand their "
-                    "own part of the suite without touching the rest of it.",
+            "help": "Re-expand the suite after this checkpoint rule has run: replace "
+                    "the nodes named with --deploy plus any task not yet on the server. "
+                    "Checkpoint tasks use this to re-expand their own part of the "
+                    "suite without touching the rest of it.",
         },
     )
     host: Optional[str] = field(
