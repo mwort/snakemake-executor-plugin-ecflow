@@ -99,6 +99,16 @@ class ExecutorSettings(ExecutorSettingsBase):
             "required": False,
         },
     )
+    addmeter: Optional[int] = field(
+        default=10,
+        metadata={
+            "help": "Add a meter counting the completed tasks to every rule family with "
+            "at least this many tasks. 0 or false never adds one.",
+            "required": False,
+            "parse_func": lambda x: 0 if str(x).lower() in ("false", "no") else int(x),
+            "unparse_func": str,
+        },
+    )
     linked: Optional[bool] = field(
         default=True,
         metadata={

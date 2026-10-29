@@ -194,6 +194,7 @@ class TestDeployedSuite(TestWorkflowsBase):
 
     __test__ = True
     def_file = "test_suite.def"
+    addmeter = 10
 
     def get_executor_settings(self) -> Optional[ExecutorSettingsBase]:
         self.ecflow_suite_name = f"sm_test_suite_{uuid.uuid4().hex}"
@@ -204,6 +205,7 @@ class TestDeployedSuite(TestWorkflowsBase):
             output_def_file=self.def_file,
             execute=False,
             linked=True,
+            addmeter=self.addmeter,
         )
 
     def get_resource_settings(self) -> ResourceSettings:
@@ -260,3 +262,25 @@ class TestDeployedSuite(TestWorkflowsBase):
         assert limit not in tasks["free"]
         for f in ["small.1.out", "small.2.out", "big.out", "free.out"]:
             assert (workdir / f).exists()
+
+    @handle_testcase
+    def test_meter(self, tmp_path):
+        self.addmeter = 3
+        workdir = Path(tmp_path) / "meter"
+        with pytest.raises(SystemExit):
+            self.run_workflow("meter", tmp_path)
+        definition = (workdir / self.def_file).read_text()
+        # family name -> its attributes, i.e. everything before its first task
+        families = {
+            block.split()[0]: block.split("task ")[0]
+            for block in definition.split("family ")[1:]
+        }
+        assert "meter done 0 3" in families["counted"]
+        assert "meter done" not in families["single"]
+
+        path = f"/{self.ecflow_suite_name}/main/counted"
+        # the task whose output already existed is counted from the start
+        assert self.ecflow_client.query("meter", path, "done") == "1"
+        self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
+        self.wait("main")
+        assert self.ecflow_client.query("meter", path, "done") == "3"

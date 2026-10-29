@@ -42,6 +42,7 @@ class Executor(RemoteExecutor):
 
     load_python = "module load python3"
     load_ecflow = "module load ecflow"
+    meter_name = "done"
 
     @property
     def load_snakemake(self) -> str:
@@ -262,6 +263,15 @@ class Executor(RemoteExecutor):
                 for name, value in self.workflow.global_resources.items()
                 if not name.startswith("_") and value is not None
             }
+        # rule -> [family, n tasks, n complete] for the rules getting a meter
+        counts = {}
+        for job in self.jobs_and_groups:
+            if not job.is_group() and job.wildcards:
+                counts[job.rule.name] = counts.get(job.rule.name, 0) + 1
+        addmeter = self.settings.addmeter
+        self.meters = {
+            rule: [None, n, 0] for rule, n in counts.items() if addmeter and n >= addmeter
+        }
         # create tasks first
         for job in self.jobs_and_groups:
             self.families[job], tasks[job] = self.create_task(job)
@@ -555,6 +565,8 @@ class Executor(RemoteExecutor):
         resources = {k: max(d[k] for d in sargs if k in d) for k in {k for d in sargs for k in d}}
 
         family = self.create_job_family(job)
+        if not job.is_group() and job.rule.name in self.meters:
+            script += "\n\n" + self.meter_script(job.rule.name, done=not needsrun)
         with family:
             task = pf.Task(
                 name=name_cleaned,
@@ -564,6 +576,38 @@ class Executor(RemoteExecutor):
                 **kwargs,
             )
         return family, task
+
+    def meter_script(self, rule: str, done: bool) -> str:
+        """Add the meter to the rule's family on its first task and return the
+        lines that count a task of it as done.
+
+        ecFlow cannot increment a meter, nor can a task set one on its family
+        with --meter, so this reads the value and alters it. Two tasks finishing
+        at the same moment can therefore lose a count. A failed update is only
+        reported, a meter is not worth aborting the task for.
+        """
+        meter = self.meters[rule]
+        if meter[0] is None:
+            meter[0] = self.families["main"].find_node(ecflow_name(rule))
+            with meter[0]:
+                pf.Meter(self.meter_name, 0, meter[1])
+        meter[2] += done
+        family, n, name = meter[0].fullname, meter[1], self.meter_name
+        return dd(f"""
+        # count this task as done on the meter of its rule family
+        v=$(ecflow_client --query meter {family}:{name}) && \\
+            ecflow_client --alter change meter {name} $(( v < {n} ? v + 1 : {n} )) {family} || \\
+            echo "Could not update the meter of {family}."
+        """)
+
+    def set_meters(self, nodes: list):
+        """Start the meters of replaced families at their completed tasks,
+        which a definition cannot carry."""
+        replaced = [n.fullname for n in nodes]
+        for family, _, done in self.meters.values():
+            path = family.fullname
+            if done and any(path == r or path.startswith(r + "/") for r in replaced):
+                self.ecflow_client.alter(path, "change", "meter", self.meter_name, str(done))
 
     def create_job_family(
             self, job: JobExecutorInterface, parent: pf.AnchorFamily = None) -> pf.AnchorFamily:
@@ -818,6 +862,8 @@ class Executor(RemoteExecutor):
         # truthy.
         if any(n is self.suite for n in nodes) and self.ecflow_state(self.suite) == "unknown":
             self.ecflow_client.begin_suite("/" + self.suite.name)
+        # after begin, which resets meters
+        self.set_meters(nodes)
         return
 
     def run_job(self, job: JobExecutorInterface):
