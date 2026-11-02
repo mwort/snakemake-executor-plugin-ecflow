@@ -11,6 +11,8 @@ from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
 from snakemake_interface_common.exceptions import WorkflowError  # noqa
 from snakemake.io import is_flagged
+from snakemake.common.tbdstring import TBDString
+from snakemake.utils import format as sm_format
 from pyflow.importer import ecflow  # finds the bindings for this python via $ECFLOW_DIR
 import pyflow as pf
 
@@ -36,6 +38,42 @@ class TokenInLimit(pf.InLimit):
     def _build(self, ecflow_parent):
         path, name = self.value.fullname.split(":")
         ecflow_parent.add_inlimit(ecflow.InLimit(name, path, self.tokens))
+
+
+class EcfVar:
+    """Stand-in for a job's input, output, params, ... when formatting a shell
+    command, so that it reads ${INPUT_REF} instead of the value.
+
+    Attribute and index access derive a sub-variable, {input.ref} -> INPUT_REF
+    and {input[1]} -> INPUT_1, and every variable formatted is recorded with
+    the path to its value on the job.
+    """
+
+    # stands in for ${NAME} until quoting is sorted out, see Executor.shell_command
+    marker = "\x00{}\x00"
+
+    def __init__(self, name: str, path: tuple, used: dict):
+        self._name, self._path, self._used = name, path, used
+
+    def _child(self, key, step):
+        name = f"{self._name}_{key}" if self._name else str(key)
+        return EcfVar(name.upper(), self._path + (step,), self._used)
+
+    def __getattr__(self, attr):
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        return self._child(attr, ("attr", attr))
+
+    def __getitem__(self, key):
+        return self._child(key, ("item", key))
+
+    def __format__(self, spec):
+        # anything else (e.g. {threads:02d}) needs the value itself
+        if spec not in ("", "q", "u"):
+            raise ValueError(f"format spec {spec!r}")
+        name = self._name or "WILDCARDS"
+        self._used[name] = self._path
+        return self.marker.format(name)
 
 
 class Executor(RemoteExecutor):
@@ -322,13 +360,15 @@ class Executor(RemoteExecutor):
             with self.create_job_family(job, self.families["clean"]):
                 cleanup[job] = pf.Task(
                     name=task.name + "_cleanup",
-                    script="rm -rf " + " ".join(temp),
+                    script="rm -rf $TEMP",
+                    TEMP=" ".join(temp),
                     triggers=self.build_trigger(consumers),
-                    # also when the producer is done but its temp files are still there
-                    defstatus=pf.state.queued
-                    if any(dag.needrun(j) for j in jobs) or any(os.path.exists(f) for f in temp)
-                    else pf.state.complete,
                 )
+            # also to run when the producer is done but its temp files are still there
+            if not any(dag.needrun(j) for j in jobs) and not any(os.path.exists(f) for f in temp):
+                self.done_tasks.append(cleanup[job])
+            if not job.is_group() and job.wildcards:
+                self.share_script(cleanup[job], self.families["clean"], job.rule.name, "_cleanup")
         return cleanup
 
     @staticmethod
@@ -530,23 +570,31 @@ class Executor(RemoteExecutor):
         else:
             jobs = [job]
         wildcards = {k: v for j in jobs for k, v in j.wildcards_dict.items()}
-        wcname = "_".join([f"{k}_{v}" for k, v in wildcards.items()])
-        name = job.name + ("_" + wcname if wcname else "")
-        # rules without wildcards will be empty here, so we use the rule name
+        if job.is_group() or not wildcards:
+            # a group family holds all its tasks without wildcard subfamilies,
+            # so they need every wildcard; rules without any use the rule name
+            wcname = "_".join([f"{k}_{v}" for k, v in wildcards.items()])
+            name = job.name + ("_" + wcname if wcname else "")
+        else:
+            # the rule and all other wildcards are in the (anchor) family path,
+            # see create_wildcard_families, so the last one is unique there
+            name = "_".join(list(wildcards.items())[-1])
         name_cleaned = ecflow_name(name)
         needsrun = any(j.dag.needrun(j) for j in jobs)
         variables = {k.upper(): v for k, v in wildcards.items()}
 
         if job.is_group():
-            variables.update({f"INPUT_{i}": str(j.input) for i, j in enumerate(jobs)})
-            variables.update({f"OUTPUT_{i}": str(j.output) for i, j in enumerate(jobs)})
-            script = "\n\n".join([self.job_script(j, order=i) for i, j in enumerate(jobs)])
+            scripts = []
+            for i, j in enumerate(jobs):
+                script, jvars = self.job_script(j, order=i)
+                scripts.append(script)
+                variables.update(jvars)
+            script = "\n\n".join(scripts)
             ecfp = (getattr(j.params, "ecflow", None) for j in jobs)
             ecflow_params = {k: v for d in ecfp if d is not None for k, v in d.items()}
         else:
-            variables.update({f"INPUT": str(job.input)})
-            variables.update({f"OUTPUT": str(job.output)})
-            script = self.job_script(job)
+            script, jvars = self.job_script(job)
+            variables.update(jvars)
             ecflow_params = getattr(job.params, "ecflow", {})
 
         # A checkpoint only learns its dependents once it has run, so it
@@ -564,22 +612,43 @@ class Executor(RemoteExecutor):
         sargs = [self.translate_resources(j) for j in jobs]
         resources = {k: max(d[k] for d in sargs if k in d) for k in {k for d in sargs for k in d}}
 
-        family = self.create_job_family(job)
         if not job.is_group() and job.rule.name in self.meters:
             script += "\n\n" + self.meter_script(job.rule.name, done=not needsrun)
+        family = self.create_job_family(job)
         with family:
             task = pf.Task(
                 name=name_cleaned,
                 submit_arguments=resources,
                 script=script,
-                defstatus=pf.state.queued if needsrun else pf.state.complete,
                 **kwargs,
             )
+        if not needsrun:
+            self.done_tasks.append(task)
+        if not job.is_group() and wildcards:
+            # a job whose script (or submit directives, which go into its
+            # header) differs from the rule's first one keeps its own
+            key = (script, tuple(sorted(resources.items())))
+            if self.rule_scripts.setdefault(job.rule.name, key) == key:
+                self.share_script(task, self.families["main"], job.rule.name)
         return family, task
 
+    def share_script(self, task: pf.Task, parent: pf.Family, rule: str, suffix: str = ""):
+        """Have the task run <rule><suffix>.ecf in its rule's family instead of
+        a script named after itself.
+
+        ecFlow looks a script up by the task's name, so to share one between
+        tasks named after their wildcards it is fetched with ECF_SCRIPT_CMD,
+        which the server runs ahead of that lookup.
+        """
+        family = parent.find_node(ecflow_name(rule))
+        path = os.path.join(family.files_path, ecflow_name(rule) + suffix + task.deploy_extension)
+        with task:
+            pf.Variable("ECF_SCRIPT_CMD", f"cat {path}")
+        self.shared_scripts[id(task)] = path
+
     def meter_script(self, rule: str, done: bool) -> str:
-        """Add the meter to the rule's family on its first task and return the
-        lines that count a task of it as done.
+        """The lines that count a task of the rule as done on the meter of
+        the rule's family, which create_tasks_from_dag adds once it exists.
 
         ecFlow cannot increment a meter, nor can a task set one on its family
         with --meter, so this reads the value and alters it. Two tasks finishing
@@ -678,52 +747,120 @@ class Executor(RemoteExecutor):
         }
         resources = {}
         for k, v in job.resources.items():
-            if k in accepted_resources and job.resources.get(k) is not None:
-                resources[accepted_resources[k]] = v
+            # resources depending on input sizes (e.g. snakemake's default
+            # mem_mb=max(2*input.size_mb, 1000)) are <TBD> while the inputs don't
+            # exist yet, i.e. for most of a freshly built suite; sbatch rejects them
+            if k in accepted_resources and v is not None and not isinstance(v, TBDString):
+                # several snakemake resources map to one directive, e.g. threads
+                # (_cores) and a default cpus=1: the larger one wins, not the last;
+                # values of different types (e.g. time "01:00:00" and runtime in
+                # minutes) can't be compared, there the last one wins
+                t = accepted_resources[k]
+                numbers = all(isinstance(x, (int, float)) for x in (resources.get(t, 0), v))
+                resources[t] = max(resources[t], v) if t in resources and numbers else v
         return resources
 
-    def job_script(self, job: JobExecutorInterface, order=None) -> str:
-        """Return the script to run for a job.
+    def job_script(self, job: JobExecutorInterface, order=None) -> tuple:
+        """Return the script to run for a job and the ecFlow variables it uses.
 
-        Rules with a shell directive are inlined into the task script. Anything
-        else (run:, script:, notebook:, wrapper: or a rule without any code,
-        e.g. touch() output) needs the snakemake runtime, so the task calls
-        snakemake back for exactly this job instead.
+        Rules with a shell directive are inlined into the task script, with
+        the job's files, params and wildcards as variables (see shell_command),
+        so all tasks of a rule usually share one script. Anything else (run:,
+        script:, notebook:, wrapper: or a rule without any code, e.g. touch()
+        output) needs the snakemake runtime, so the task calls snakemake back
+        for exactly this job instead.
         """
+        # group tasks number their variables, OUTPUT_0, OUTPUT_1, ...
+        ostr = f"_{order}" if order is not None else ""
+        variables = {
+            f"INPUT{ostr}": sm_format("{v}", v=job.input),
+            f"OUTPUT{ostr}": sm_format("{v}", v=job.output),
+        }
         if job.shellcmd is None:
-            return f"{self.load_snakemake}\n\n{self.format_job_exec(job)}"
+            return f"{self.load_snakemake}\n\n{self.format_job_exec(job)}", variables
 
         lines = []
 
         if job.env_modules:
             lines.append(job.env_modules.shellcmd(""))
 
-        # group tasks number their variables, OUTPUT_0, OUTPUT_1, ...
-        ostr = f"_{order}" if order is not None else ""
         if len(job.output) > 0:
             lines.append(f"rm -rf $OUTPUT{ostr}")
 
         # snakemake creates the directories of outputs and logs before a job
-        dirs = " ".join(sorted({d for d in map(os.path.dirname, [*job.output, *job.log]) if d}))
-        if dirs:
-            lines.append(f"mkdir -p {dirs}")
+        if job.log:
+            variables[f"LOG{ostr}"] = sm_format("{v}", v=job.log)
+            lines.append(f"mkdir -p $(dirname $OUTPUT{ostr} $LOG{ostr})")
+        elif len(job.output) > 0:
+            lines.append(f"mkdir -p $(dirname $OUTPUT{ostr})")
 
         # like snakemake, remove the outputs of a failed job, so a partial
         # output (e.g. a directory created before the command failed) is not
         # taken as done when the suite is rebuilt
         if len(job.output) > 0:
             lines.append(f"trap 'rm -rf $OUTPUT{ostr}' ERR")
-        lines.append(job.shellcmd)
+        command, shell_vars = self.shell_command(job, ostr, variables)
+        variables.update(shell_vars)
+        lines.append(command)
         if len(job.output) > 0:
             lines.append("trap - ERR")
 
         # and touches touch() outputs after it
         touch = [f for f in job.output if is_flagged(f, "touch")]
         if touch:
-            lines.append("touch " + " ".join(touch))
+            variables[f"TOUCH{ostr}"] = " ".join(touch)
+            lines.append(f"touch $TOUCH{ostr}")
         lines.append(self.io_check_script(job, order=order))
 
-        return "\n\n".join(lines)
+        return "\n\n".join(lines), variables
+
+    # characters a value cannot have inside export NAME="%NAME%"
+    unsafe_value = re.compile(r'["$`\\%\n]')
+
+    def shell_command(self, job: JobExecutorInterface, ostr: str = "", taken: dict = None) -> tuple:
+        """The job's shell command with ${VARIABLES} in place of the values of
+        its input, output, params, wildcards, threads, resources and log, and
+        those variables.
+
+        Formatted by snakemake itself, with stand-ins (EcfVar) for those
+        fields, so the command only differs between jobs of a rule in the
+        variables. Falls back to the plain command with the values inlined when
+        that is not possible: a format spec needing the value, a value that
+        would break the export line, or a variable name already taken by
+        another value.
+        """
+        used = {}
+        stand_ins = {
+            f: EcfVar(f.upper(), (f,), used)
+            for f in ["input", "output", "params", "threads", "resources", "log"]
+        }
+        # wildcards are already variables by their own names, e.g. $SAMPLE
+        stand_ins["wildcards"] = EcfVar("", ("wildcards",), used)
+        try:
+            command = job.format_wildcards(job.rule.shellcmd, **stand_ins)
+        except Exception:
+            return job.shellcmd, {}
+
+        roots = {f: getattr(job, f) for f in stand_ins}
+        roots["wildcards"] = job.wildcards
+        variables = {}
+        for name, path in used.items():
+            value = roots[path[0]]
+            for kind, key in path[1:]:
+                value = getattr(value, key) if kind == "attr" else value[key]
+            value = sm_format("{v}", v=value)
+            name += ostr
+            if self.unsafe_value.search(value) or (taken or {}).get(name, value) != value:
+                return job.shellcmd, {}
+            variables[name] = value
+
+        # snakemake quotes {x:q} with shlex.quote, i.e. in single quotes, in
+        # which bash would not expand the variable
+        def name(m):
+            return m.group(1) + ostr
+        command = re.sub("'\x00(\\w+)\x00'", lambda m: '"${%s}"' % name(m), command)
+        command = re.sub("\x00(\\w+)\x00", lambda m: "${%s}" % name(m), command)
+        return command, variables
 
 
     def io_check_script(self, job: JobExecutorInterface, order=None) -> str:
@@ -837,15 +974,23 @@ class Executor(RemoteExecutor):
             else:
                 tasks.update({id(t): t for t in node.all_tasks})
                 families.update({id(f): f for f in node.all_families})
+        # the tasks of a rule share one script, see share_script
+        written = set()
         for task in tasks.values():
             script, includes = task.generate_script()
-            target.deploy_task(task.deploy_path, script, includes)
+            path = self.shared_scripts.get(id(task), task.deploy_path)
+            if path in written:
+                # still checked: pyflow raises if a shared script differs
+                target.deploy_uniqueness_check("\n".join(script), path)
+                continue
+            target.deploy_task(path, script, includes)
+            written.add(path)
         for family in families.values():
             manual = self.suite.generate_stub(family.manual)
             if manual:
                 target.deploy_manual(family.manual_path, manual)
         target.deploy_headers()
-        print(f"Deployed {len(tasks)} task scripts.")
+        print(f"Deployed {len(written)} scripts for {len(tasks)} tasks.")
         if not self.settings.linked:
             print("Copying Snakefile to deploy directory...")
             shutil.copy(self.snakefile, self.deploy_dir + "/Snakefile")
