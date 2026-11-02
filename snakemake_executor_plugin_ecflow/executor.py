@@ -317,6 +317,7 @@ class Executor(RemoteExecutor):
 
     def create_tasks_from_dag(self):
         tasks = {}
+        self.done_tasks = []  # tasks that need not run, see set_done
         dag = self.workflow.dag
         self.jobs_and_groups, self.jobs, self.groups = self.get_jobs_and_groups()
         # global task limit and one limit per --resources entry (other than
@@ -337,9 +338,17 @@ class Executor(RemoteExecutor):
         self.meters = {
             rule: [None, n, 0] for rule, n in counts.items() if addmeter and n >= addmeter
         }
+        # rule -> (script, resources) of its first job, see create_task
+        self.rule_scripts = {}
+        # id(task) -> path of the script it shares, see share_script
+        self.shared_scripts = {}
         # create tasks first
         for job in self.jobs_and_groups:
             self.families[job], tasks[job] = self.create_task(job)
+        for rule, meter in self.meters.items():
+            meter[0] = self.families["main"].find_node(ecflow_name(rule))
+            with meter[0]:
+                pf.Meter(self.meter_name, 0, meter[1])
         # assign triggers
         for job, task in tasks.items():
             deps = dag.dependencies[job]
@@ -480,17 +489,17 @@ class Executor(RemoteExecutor):
         keep = self.cover_nodes(nodes)
         return keep[0] if len(keep) == 1 else self.and_all(keep)
 
-    def downstream_jobs(self, rule: str) -> set:
-        """Every job that depends, directly or not, on a job of this rule.
+    def downstream_jobs(self, jobs: list) -> set:
+        """Every job that depends, directly or not, on one of these jobs.
 
-        The rule's own jobs are excluded: a checkpoint must not replace the
+        Not on every job of their rule: a checkpoint rule with a job per
+        wildcard (e.g. per dataset) must only replace what its own job feeds.
+        The jobs themselves are excluded: a checkpoint must not replace the
         family holding the task that is doing the replacing.
         """
         dag = self.workflow.dag
-        seen, frontier = set(), [j for j in dag.jobs if j.rule.name == rule]
-        if not frontier:
-            raise WorkflowError(f"no job of rule {rule} is in the DAG")
-        own = set(frontier)
+        frontier = list(jobs)
+        seen, own = set(), set(frontier)
         while frontier:
             job = frontier.pop()
             for dep in dag.depending[job]:
@@ -499,9 +508,9 @@ class Executor(RemoteExecutor):
                     frontier.append(dep)
         return seen - own
 
-    def downstream_nodes(self, rule: str, tasks: dict) -> list:
-        """The nodes to replace so that one rule's dependents are rebuilt."""
-        jobs = self.downstream_jobs(rule)
+    def downstream_nodes(self, jobs: list, tasks: dict) -> list:
+        """The nodes to replace so that the dependents of these jobs are rebuilt."""
+        jobs = self.downstream_jobs(jobs)
         nodes = set()
         for job in jobs:
             key = self.groups[job] if job.group else job
@@ -532,12 +541,10 @@ class Executor(RemoteExecutor):
         """
         for job, task in tasks.items():
             jobs = job.jobs if job.is_group() else [job]
-            rules = dict.fromkeys(
-                j.rule.name for j in jobs if getattr(j.rule, "is_checkpoint", False)
-            )
-            if not rules:
+            checkpoints = [j for j in jobs if getattr(j.rule, "is_checkpoint", False)]
+            if not checkpoints:
                 continue
-            nodes = [n for rule in rules for n in self.downstream_nodes(rule, tasks)]
+            nodes = self.downstream_nodes(checkpoints, tasks)
             paths = dict.fromkeys(self.node_path(n) for n in nodes)
             with task:
                 pf.Variable("CHECKPOINT_DEPLOY", ",".join(paths))
@@ -683,12 +690,9 @@ class Executor(RemoteExecutor):
         reported, a meter is not worth aborting the task for.
         """
         meter = self.meters[rule]
-        if meter[0] is None:
-            meter[0] = self.families["main"].find_node(ecflow_name(rule))
-            with meter[0]:
-                pf.Meter(self.meter_name, 0, meter[1])
         meter[2] += done
-        family, n, name = meter[0].fullname, meter[1], self.meter_name
+        family = f"{self.families['main'].fullname}/{ecflow_name(rule)}"
+        n, name = meter[1], self.meter_name
         return dd(f"""
         # count this task as done on the meter of its rule family
         v=$(ecflow_client --query meter {family}:{name}) && \\
@@ -743,7 +747,7 @@ class Executor(RemoteExecutor):
 
     def create_wildcard_families(
             self, job: JobExecutorInterface, parent: pf.AnchorFamily) -> pf.AnchorFamily:
-        # take all wildcards except the last one
+        # take all wildcards except the last one, which names the task
         wc = [k+"_"+v for k, v in list(job.wildcards_dict.items())][:-1]
         for n in [job.rule.name] + wc:
             fname = ecflow_name(n)
@@ -952,15 +956,53 @@ class Executor(RemoteExecutor):
             except KeyError:
                 print(f"{path} is no longer part of the suite, skipping it.")
         # new nodes first, so the triggers of the replaced ones resolve
-        return self.new_nodes() + named
+        return self.new_nodes(named) + named
 
-    def new_nodes(self) -> list:
-        """Nodes covering the tasks that are not on the server yet."""
+    def new_nodes(self, named: list) -> list:
+        """Nodes covering the tasks that are not on the server yet and feed the
+        named nodes, i.e. the jobs this checkpoint's output expanded to.
+
+        Not every task new to the server: another checkpoint rebuilding at the
+        same time may have just added its own, and replacing those would reset
+        tasks already submitted, orphaning their jobs. Without named nodes (a
+        checkpoint whose dependents have no task) all new tasks are taken.
+        """
         self.ecflow_client.sync_local()
         defs = self.ecflow_client.get_defs()
-        tasks = [*self.tasks.values(), *self.cleanup_tasks.values()]
-        new = [t for t in tasks if defs.find_abs_node(t.fullname) is None]
-        return self.cover_nodes(new) if new else []
+        dag = self.workflow.dag
+        prefixes = [n.fullname for n in named]
+
+        def under(task):
+            return any(task.fullname == p or task.fullname.startswith(p + "/") for p in prefixes)
+
+        # the jobs feeding the named nodes: walk upstream from them once
+        feeding = {j for k, t in self.tasks.items() if under(t) for j in (k.jobs if k.is_group() else [k])}
+        frontier = list(feeding)
+        while frontier:
+            for dep in dag.dependencies[frontier.pop()]:
+                if dep not in feeding:
+                    feeding.add(dep)
+                    frontier.append(dep)
+        new = []
+        for key, task in [*self.tasks.items(), *self.cleanup_tasks.items()]:
+            jobs = key.jobs if key.is_group() else [key]
+            if defs.find_abs_node(task.fullname) is None and (not named or feeding & set(jobs)):
+                new.append(task)
+        # A family that is already on the server may hold tasks this build
+        # doesn't know of (another checkpoint's), so only families new to the
+        # server are replaced whole; for the others, their new children.
+        nodes = []
+
+        def add(node):
+            if isinstance(node, pf.Task) or defs.find_abs_node(node.fullname) is None:
+                nodes.append(node)
+            else:
+                for child in node.executable_children:
+                    add(child)
+
+        for node in self.cover_nodes(new) if new else []:
+            add(node)
+        return nodes
 
     def deploy(self):
         print("Checking suite definition...")
@@ -1025,18 +1067,90 @@ class Executor(RemoteExecutor):
     def upload_suite(self, nodes: list):
         """Replace the given nodes on the ecFlow server."""
         ecf_host = self.settings.host
-        print("Uploading to server...")
-        for node in nodes:
-            print(f"Replace {node.fullname} on {ecf_host}...")
-            node.replace_on_server(ecf_host, 3141)
-        # begin suite if not already done. Identity, not `in`: pyflow nodes
-        # overload == to build trigger expressions, so `node in list` is always
-        # truthy.
-        if any(n is self.suite for n in nodes) and self.ecflow_state(self.suite) == "unknown":
-            self.ecflow_client.begin_suite("/" + self.suite.name)
-        # after begin, which resets meters
-        self.set_meters(nodes)
+        suite = "/" + self.suite.name
+        # Identity, not `in`: pyflow nodes overload == to build trigger
+        # expressions, so `node in list` is always truthy.
+        full = any(n is self.suite for n in nodes)
+        done = self.done_paths(nodes)
+        # Tasks that need not run are set complete after the upload (set_done),
+        # so nothing may be submitted until then: a whole suite is created
+        # suspended, a running one is suspended while parts of it are replaced
+        # (unless it is suspended already, then it stays so). A checkpoint
+        # usually replaces only tasks that are new or need to run, and then
+        # leaves the suite alone, also when several rebuild at the same time.
+        pause = bool(done) and not full and self.ecflow_client.query("dstate", suite) != "suspended"
+        if pause:
+            self.ecflow_client.suspend(suite)
+        try:
+            print("Uploading to server...")
+            defs = self.suite.ecflow_definition()
+            if not full:
+                self.prune_new_parents(defs, nodes)
+            for node in nodes:
+                print(f"Replace {node.fullname} on {ecf_host}...")
+                self.ecflow_client.replace(node.fullname, defs, True, True)
+            # begin suite if not already done
+            if full and self.ecflow_state(self.suite) == "unknown":
+                self.ecflow_client.begin_suite(suite)
+            # after begin, which resets states and meters
+            self.set_done(done)
+            self.set_meters(nodes)
+        finally:
+            if pause:
+                self.ecflow_client.resume(suite)
         return
+
+    def prune_new_parents(self, defs, nodes: list):
+        """Remove from the client definition the nodes that a replace would add
+        on the side.
+
+        A replace creates missing parent families from the client definition,
+        with all their children, not only the replaced node. A checkpoint
+        rebuild would thus add tasks another checkpoint is about to deploy
+        itself; ecFlow submits them, the other rebuild replaces them again and
+        their first jobs are left as zombies. So in every family the server
+        does not have yet, only the replaced nodes and their ancestors are kept.
+        ecFlow checks the triggers of the whole client definition, so those of
+        the nodes not being replaced, which may refer to the removed ones, are
+        dropped from it too; only the replaced nodes are sent to the server.
+        """
+        self.ecflow_client.sync_local()
+        server = self.ecflow_client.get_defs()
+        replaced = [n.fullname for n in nodes]
+        keep = set(replaced)
+        for path in replaced:
+            parts = path.split("/")
+            keep.update("/".join(parts[:i]) for i in range(2, len(parts)))
+        for path in sorted(keep - set(replaced)):
+            if server is not None and server.find_abs_node(path) is not None:
+                continue
+            parent = defs.find_abs_node(path)
+            for child in list(parent.nodes) if parent is not None else []:
+                child_path = child.get_abs_node_path()
+                if child_path not in keep and not any(child_path.startswith(r + "/") for r in replaced):
+                    child.remove()
+        for node in defs.get_all_nodes():
+            path = node.get_abs_node_path()
+            if not any(path == r or path.startswith(r + "/") for r in replaced):
+                node.delete_trigger()
+                node.delete_complete()
+
+    def done_paths(self, nodes: list) -> list:
+        """Paths of the tasks that need not run, in the replaced nodes."""
+        replaced = [n.fullname for n in nodes]
+        return [t.fullname for t in self.done_tasks
+                if any(t.fullname == r or t.fullname.startswith(r + "/") for r in replaced)]
+
+    def set_done(self, paths: list, batch: int = 5000):
+        """Set the tasks that need not run to complete.
+
+        A definition can only carry a defstatus, which is also what requeue
+        resets a node to, so tasks loaded with defstatus complete could not be
+        requeued by hand. They are loaded queued and set complete here instead.
+        """
+        for i in range(0, len(paths), batch):
+            self.ecflow_client.force_state(paths[i:i + batch], ecflow.State.complete)
+        print(f"Set {len(paths)} tasks complete that need not run.")
 
     def run_job(self, job: JobExecutorInterface):
         # Implement here how to run a job.
