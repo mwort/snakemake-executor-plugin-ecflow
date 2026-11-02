@@ -256,10 +256,13 @@ class Executor(RemoteExecutor):
         ecfsets.pop("execute", None)
         ecfsets.pop("linked", None)
         ecfsets.update(overrides)
+        # --nolock: a rebuild only deploys, it writes no outputs, and several
+        # checkpoint tasks of one suite can rebuild at the same time
         parts = [
             f"{self.get_python_executable()} -m snakemake"
-            f" -s {self.get_snakefile()} -j 1 --executor ecflow"
+            f" -s {self.get_snakefile()} -j 1 --nolock --executor ecflow"
         ]
+        parts += self.profile_args
         parts += [
             f"--ecflow-{k.replace('_', '-')} {v}"
             for k, v in ecfsets.items()
@@ -267,6 +270,30 @@ class Executor(RemoteExecutor):
         ]
         parts.append(target)
         return " \\\n    ".join(parts) + "\n"
+
+    @property
+    def profile_args(self) -> list:
+        """The profiles the suite was built with, for the snakemake calls of its
+        tasks (rebuild_command): --profile/--workflow-profile as given, made
+        absolute, and $SNAKEMAKE_PROFILE, which the batch jobs don't inherit.
+
+        Only a workflow profile in profiles/default is found without them. The
+        rest of the command line is not repeated: the targets, -n or --forcerun
+        must not apply to every rebuild, and the profile is where settings belong.
+        """
+        def absolute(path):
+            return str(restore_common_linked_dirs(Path(self.work_dir, path)))
+
+        args, argv = [], sys.argv[1:]
+        for i, arg in enumerate(argv):
+            for opt in ("--profile", "--workflow-profile"):
+                if arg == opt and i + 1 < len(argv):
+                    args.append(f"{opt} {absolute(argv[i + 1])}")
+                elif arg.startswith(opt + "="):
+                    args.append(f"{opt} {absolute(arg.split('=', 1)[1])}")
+        if os.environ.get("SNAKEMAKE_PROFILE") and not any(a.startswith("--profile ") for a in args):
+            args.append(f"--profile {absolute(os.environ['SNAKEMAKE_PROFILE'])}")
+        return args
 
     def create_evaluate_task(self):
         script = dd(f"""
