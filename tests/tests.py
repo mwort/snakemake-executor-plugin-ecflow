@@ -195,6 +195,7 @@ class TestDeployedSuite(TestWorkflowsBase):
     __test__ = True
     def_file = "test_suite.def"
     addmeter = 10
+    monitor = 0
 
     def get_executor_settings(self) -> Optional[ExecutorSettingsBase]:
         self.ecflow_suite_name = f"sm_test_suite_{uuid.uuid4().hex}"
@@ -206,6 +207,7 @@ class TestDeployedSuite(TestWorkflowsBase):
             execute=False,
             linked=True,
             addmeter=self.addmeter,
+            monitor=self.monitor,
         )
 
     def get_resource_settings(self) -> ResourceSettings:

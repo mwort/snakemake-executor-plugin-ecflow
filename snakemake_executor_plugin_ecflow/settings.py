@@ -109,6 +109,18 @@ class ExecutorSettings(ExecutorSettingsBase):
             "unparse_func": str,
         },
     )
+    monitor: Optional[int] = field(
+        default=0,
+        metadata={
+            "help": "Run the admin/monitor task, which reports the progress of the suite "
+            "(tasks done, runtimes and estimated time to completion per rule and overall, in "
+            "its labels, job output and <deploy_dir>/progress.md), every this many minutes "
+            "while main is running. With 0 it is only run by hand.",
+            "required": False,
+            "parse_func": lambda x: 0 if str(x).lower() in ("false", "no") else int(x),
+            "unparse_func": str,
+        },
+    )
     linked: Optional[bool] = field(
         default=True,
         metadata={

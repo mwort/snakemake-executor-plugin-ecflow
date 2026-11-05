@@ -128,6 +128,7 @@ class Executor(RemoteExecutor):
         self.env_task = self.create_env_task()
         self.evaluate_task = self.create_evaluate_task()
         self.clean_task = self.create_clean_task()
+        self.monitor_task = self.create_monitor_task()
         self.tasks = self.create_tasks_from_dag()
 
         self.deploy()
@@ -928,6 +929,36 @@ class Executor(RemoteExecutor):
                 defstatus=pf.state.complete,
             )
         return clean
+
+    def create_monitor_task(self):
+        """A task reporting the suite's progress, see monitor.py: the overall numbers
+        in its labels, the table per rule in its job output and <deploy_dir>/progress.md.
+        It also corrects the rule meters (--ecflow-addmeter) to the complete tasks.
+        With --ecflow-monitor minutes it runs that often while main is active or
+        submitted, i.e. not before it starts, nor once it is complete or a task has
+        aborted; otherwise it is complete and only run by hand. It takes no slot of
+        the task limit; a failed report only shows in its status label."""
+        minutes = self.settings.monitor
+        files = f"{self.deploy_dir}/progress"
+        script = dd(f"""
+        {self.load_snakemake}
+        {self.get_python_executable()} -m snakemake_executor_plugin_ecflow.monitor --labels --meters {self.meter_name} \\
+            --suite {self.suite.name} --report {files}.md --json {files}.json --cache {files}_runs.json \\
+            || ecflow_client --label=status "Report failed, see the job output."
+        """)
+        main = self.families["main"]
+        schedule = {"triggers": main.active | main.submitted} if minutes else {"defstatus": pf.state.complete}
+        with self.families["admin"]:
+            monitor = pf.Task(
+                name="monitor",
+                script=script,
+                labels={"progress": "", "status": "", "time": ""},
+                **schedule,
+            )
+            if minutes:
+                with monitor:
+                    pf.Cron(f"00:00 23:59 {minutes // 60:02d}:{minutes % 60:02d}")
+        return monitor
 
     def node_path(self, node) -> str:
         """Suite-relative path of a node, the form find_node expects."""
