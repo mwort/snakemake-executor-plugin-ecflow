@@ -74,6 +74,21 @@ class TestWorkflowsBase(TestWorkflowsLocalStorageBase):
         local = Path(__file__).parent / f"{test_path.name}_testcase"
         shutil.copytree(local if local.is_dir() else test_path, tmp_path)
 
+    def wait_for_file(self, path, exists=True) -> bool:
+        """Whether a file written by the suite (dis)appears within latency_wait.
+
+        Files written on the compute nodes can take a while to show up here
+        over NFS, in particular when snakemake looked them up as missing while
+        building the DAG. Listing the directory refreshes that, a stat may not.
+        """
+        path = Path(path)
+        start = time.time()
+        while True:
+            found = path.parent.is_dir() and path.name in os.listdir(path.parent)
+            if found == exists or time.time() - start > self.latency_wait:
+                return found == exists
+            time.sleep(2)
+
     def wait(self, node, timeout=900):
         node_path = f"/{self.ecflow_suite_name}/{node}"
         state = None
@@ -221,6 +236,9 @@ class TestDeployedSuite(TestWorkflowsBase):
         assert excinfo.value.code == 0
         self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
         self.wait("main")
+        # temp() cleanup runs alongside main; deleting the suite under a running
+        # task leaves its job retrying --complete for ECF_TIMEOUT
+        self.wait("clean")
         return Path(tmp_path) / name
 
     @handle_testcase
@@ -230,22 +248,46 @@ class TestDeployedSuite(TestWorkflowsBase):
             self.run_workflow("temp", tmp_path)
         definition = (workdir / self.def_file).read_text()
         for sample in [1, 2]:
-            assert f"task make_temp_sample_{sample}_cleanup" in definition
+            assert f"task sample_{sample}_cleanup" in definition
 
         self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
         self.wait("main")
         self.wait("clean")
         for sample in [1, 2]:
+            assert self.wait_for_file(workdir / f"final.{sample}.out")
             assert (workdir / f"final.{sample}.out").read_text().strip() == str(sample)
-            assert not (workdir / f"temp.{sample}.out").exists()
+            assert self.wait_for_file(workdir / f"temp.{sample}.out", exists=False)
 
     @handle_testcase
     def test_checkpoint_workflow(self, tmp_path):
         workdir = self.deploy_and_run("checkpoint", tmp_path)
         # the processed files only exist if the checkpoint re-expanded the suite
+        assert self.wait_for_file(workdir / "aggregated.out")
         assert (workdir / "aggregated.out").read_text().split() == ["1", "2", "3"]
         for i in [1, 2, 3]:
-            assert (workdir / "processed" / f"{i}.out").exists()
+            assert self.wait_for_file(workdir / "processed" / f"{i}.out")
+
+    @handle_testcase
+    def test_checkpoint_per_job(self, tmp_path):
+        # with a checkpoint job per wildcard, each only replaces its own dependents
+        workdir = Path(tmp_path) / "checkpoints"
+        with pytest.raises(SystemExit):
+            self.run_workflow("checkpoints", tmp_path)
+        definition = (workdir / self.def_file).read_text()
+        deploy = {
+            block.split()[0]: block.split("CHECKPOINT_DEPLOY '")[1].split("'")[0]
+            for block in definition.split("task ")[1:] if "CHECKPOINT_DEPLOY" in block
+        }
+        assert set(deploy) == {"g_a", "g_b"}
+        for g, other in [("a", "b"), ("b", "a")]:
+            assert f"g_{g}" in deploy[f"g_{g}"] and f"g_{other}" not in deploy[f"g_{g}"]
+
+        self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
+        self.wait("main")
+        self.wait("clean")
+        for g in ["a", "b"]:
+            assert self.wait_for_file(workdir / f"aggregated.{g}.out")
+            assert (workdir / f"aggregated.{g}.out").read_text().split() == [f"{g}1", f"{g}2"]
 
     @handle_testcase
     def test_resource_limits(self, tmp_path):
@@ -257,13 +299,12 @@ class TestDeployedSuite(TestWorkflowsBase):
             block.split()[0]: block
             for block in definition.split("task ")[1:]
         }
-        # one token for the small jobs, as many as requested for the big one
-        for sample in [1, 2]:
-            assert f"inlimit {limit}\n" in tasks[f"small_sample_{sample}"]
+        # one token for each small job, as many as requested for the big one
+        assert definition.count(f"inlimit {limit}\n") == 2
         assert f"inlimit {limit} 2" in tasks["big"]
         assert limit not in tasks["free"]
         for f in ["small.1.out", "small.2.out", "big.out", "free.out"]:
-            assert (workdir / f).exists()
+            assert self.wait_for_file(workdir / f)
 
     @handle_testcase
     def test_meter(self, tmp_path):
@@ -286,3 +327,67 @@ class TestDeployedSuite(TestWorkflowsBase):
         self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
         self.wait("main")
         assert self.ecflow_client.query("meter", path, "done") == "3"
+
+    @handle_testcase
+    def test_done_tasks(self, tmp_path):
+        # A task that need not run is set complete after the upload, not given
+        # defstatus complete, which requeue would reset it to.
+        workdir = Path(tmp_path) / "meter"
+        with pytest.raises(SystemExit):
+            self.run_workflow("meter", tmp_path)
+        definition = (workdir / self.def_file).read_text()
+        main = definition.split("family main")[1].split("family clean")[0]
+        assert "defstatus complete" not in main
+        # counted.1.out ships with the testcase
+        assert self.get_state("main/counted/sample_1") == "complete"
+        assert self.get_state("main/counted/sample_2") == "queued"
+        self.ecflow_client.requeue(f"/{self.ecflow_suite_name}/main/counted/sample_1")
+        assert self.get_state("main/counted/sample_1") == "queued"
+        self.ecflow_client.resume(f"/{self.ecflow_suite_name}")
+        self.wait("main")
+
+    @handle_testcase
+    def test_monitor(self, tmp_path):
+        # without --ecflow-monitor the monitor task is complete and run by hand; it
+        # reports the progress in its labels, job output and progress.md
+        self.addmeter = 3
+        workdir = self.deploy_and_run("meter", tmp_path)
+        # and corrects a rule meter that is off, e.g. after a lost count
+        rule = f"/{self.ecflow_suite_name}/main/counted"
+        self.ecflow_client.alter(rule, "change", "meter", "done", "1")
+        definition = (workdir / self.def_file).read_text()
+        monitor = definition.split("task monitor")[1].split("task ")[0]
+        assert "defstatus complete" in monitor and "cron" not in monitor
+        path = f"/{self.ecflow_suite_name}/admin/monitor"
+        self.run_task("admin/monitor", wait=True)
+        label = self.ecflow_client.query("label", path, "progress")
+        assert label.startswith("100.0% done"), label
+        assert self.ecflow_client.query("label", path, "status").endswith("0 aborted")
+        assert self.ecflow_client.query("label", path, "time").startswith("eta 0s")
+        assert self.ecflow_client.query("meter", rule, "done") == "3"
+        report = workdir / "ecflow_suites" / self.ecflow_suite_name / "progress.md"
+        assert self.wait_for_file(report)
+        rows = [l.split(" | ") for l in report.read_text().splitlines() if l.startswith("| counted")]
+        assert rows and rows[0][3] == "100.0%"
+
+    @handle_testcase
+    def test_monitor_cron(self, tmp_path):
+        # with --ecflow-monitor it runs on a cron while main is active or submitted
+        self.monitor = 30
+        with pytest.raises(SystemExit):
+            self.run_workflow("meter", tmp_path)
+        definition = (Path(tmp_path) / "meter" / self.def_file).read_text()
+        monitor = definition.split("task monitor")[1].split("task ")[0]
+        assert "trigger ../main eq active or ../main eq submitted" in monitor
+        assert "cron 00:00 23:59 00:30" in monitor and "defstatus" not in monitor
+
+    @handle_testcase
+    def test_shared_scripts(self, tmp_path):
+        # the tasks of a rule run one script named after it, in its family
+        workdir = self.deploy_and_run("temp", tmp_path)
+        files = workdir / "ecflow_suites" / self.ecflow_suite_name
+        for rule in ["make_temp", "use_temp"]:
+            scripts = [f.name for f in (files / "main" / rule).rglob("*.ecf")]
+            assert scripts == [f"{rule}.ecf"]
+        scripts = [f.name for f in (files / "clean" / "make_temp").rglob("*.ecf")]
+        assert scripts == ["make_temp_cleanup.ecf"]

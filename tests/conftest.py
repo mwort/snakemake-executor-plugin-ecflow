@@ -10,7 +10,9 @@ def tmp_path(tmp_path_factory, request):
     class_name = request.node.parent.name if request.node.parent else ""
     prefix = f"tmp_{class_name}_{request.node.name}"
     path = test_dir / (prefix)
-    path.mkdir(exist_ok=True, parents=True)
+    # left behind by an interrupted run, or kept with CLEAN_SUITES = False
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True)
     yield path
     # Cleanup after the test
     if CLEAN_SUITES:

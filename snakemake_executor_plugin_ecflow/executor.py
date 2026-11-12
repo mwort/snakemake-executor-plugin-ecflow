@@ -918,10 +918,19 @@ class Executor(RemoteExecutor):
         return script
 
     def create_clean_task(self):
-        """Create a task to clean the suite."""
+        """Create a task to clean the suite.
+
+        The task deletes the suite it is part of, so it reports complete first
+        and exits without the job footer: a --complete or --abort for a node
+        that no longer exists is retried for ECF_TIMEOUT (a day by default),
+        keeping the job alive all that time.
+        """
         script = dd(f"""
+        ecflow_client --complete
+        trap - 0 $SIGNAL_LIST
         ecflow_client --delete=force yes /{self.suite.name}
         rm -rf {self.deploy_dir} {self.output_dir}
+        exit 0
         """)
         with self.families["clean"]:
             clean = pf.Task(
