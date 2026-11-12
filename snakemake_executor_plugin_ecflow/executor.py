@@ -767,6 +767,7 @@ class Executor(RemoteExecutor):
             "time": "time",
             "mem": "memory_per_cpu",
             "mem_mb": "memory_per_cpu",
+            "memory_per_cpu": "memory_per_cpu",
             "total_tasks": "total_tasks",
             "_cores": "cpus_per_task",
             "runtime": "time",
