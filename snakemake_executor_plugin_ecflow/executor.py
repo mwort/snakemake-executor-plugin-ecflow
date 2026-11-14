@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import heapq
 import shutil
 from pathlib import Path
 from typing import List, Generator
@@ -178,7 +179,7 @@ class Executor(RemoteExecutor):
     def create_standard_families(self):
         families = {}
         with self.suite:
-            for f in ["make", "admin", "main", "clean"]:
+            for f in ["make", "admin", "clean", "main"]:
                 families[f] = pf.AnchorFamily(f)
             # clean holds the temp() cleanup tasks, which run alongside main
             families["make"] >> families["main"]
@@ -602,23 +603,81 @@ class Executor(RemoteExecutor):
         dag._needrun = needrun
         dag._group = dag_groups
 
-        jobs = []
+        jobs = [
+            job
+            for layer in dag.toposorted()
+            for job in sorted(layer, key=lambda j: j.wildcards)
+            if job.output
+        ]
+        jobs = self.prioritize(jobs)
         groups_seen = set()
         sorted_jobs_or_groups = []
-
-        for layer in self.workflow.dag.toposorted():
-            for job in sorted(layer, key=lambda j: j.wildcards):
-                if not job.output:
-                    continue
-                if job.group is None:
-                    sorted_jobs_or_groups.append(job)
-                else:
-                    group = groups_dict[job]
-                    if group not in groups_seen:
-                        sorted_jobs_or_groups.append(group)
-                        groups_seen.add(group)
-                jobs.append(job)
+        for job in jobs:
+            if job.group is None:
+                sorted_jobs_or_groups.append(job)
+            else:
+                group = groups_dict[job]
+                if group not in groups_seen:
+                    sorted_jobs_or_groups.append(group)
+                    groups_seen.add(group)
         return sorted_jobs_or_groups, jobs, groups_dict
+
+    def job_priority(self, job: JobExecutorInterface):
+        """Return the snakemake priority of a job.
+
+        The dag only holds the priorities of jobs that need to run, the others
+        get their rule's priority. From snakemake 9.17 that may be a function
+        of the wildcards, input and attempt, expanded like snakemake does it.
+        """
+        priority = self.workflow.dag._priority.get(job)
+        if priority is not None:
+            return priority
+        priority = job.rule.priority
+        if not callable(priority):
+            return priority
+        try:
+            return job.rule.expand_priority(job.wildcards_dict, job.input, job.attempt)
+        except Exception as e:
+            # snakemake never evaluates it for jobs that need not run, so a
+            # failing function (e.g. on input that is gone) shouldn't stop the
+            # deployment, it only places the job's task in the suite
+            self.logger.warning(f"Priority of {job} could not be evaluated, using 0: {e}")
+            return 0
+
+    def prioritize(self, jobs: list) -> list:
+        """Reorder topologically sorted jobs by their snakemake priority.
+
+        ecFlow has no priorities, but submits eligible tasks in the order of
+        the suite definition until the limits are full, so jobs with a higher
+        priority (rule priority, --prioritize) are placed earlier. A job
+        inherits the highest priority of the jobs depending on it, so it still
+        comes before them, i.e. the order stays topological. Among jobs of
+        equal priority the given order is kept, so without priorities nothing
+        changes.
+        """
+        dag = self.workflow.dag
+        index = {job: i for i, job in enumerate(jobs)}
+        priority = {job: self.job_priority(job) for job in jobs}
+        if len(set(priority.values())) <= 1:
+            return jobs
+        for job in reversed(jobs):
+            for d in dag.depending[job]:
+                if d in priority:
+                    priority[job] = max(priority[job], priority[d])
+        # Kahn's algorithm, taking the ready job with the highest priority
+        waiting = {job: sum(d in index for d in dag.dependencies[job]) for job in jobs}
+        ready = [(-priority[j], index[j], j) for j in jobs if not waiting[j]]
+        heapq.heapify(ready)
+        ordered = []
+        while ready:
+            job = heapq.heappop(ready)[2]
+            ordered.append(job)
+            for d in dag.depending[job]:
+                if d in waiting:
+                    waiting[d] -= 1
+                    if not waiting[d]:
+                        heapq.heappush(ready, (-priority[d], index[d], d))
+        return ordered
 
     def create_task(self, job: JobExecutorInterface, **kwargs) -> pf.Task:
         if job.is_group():
@@ -708,17 +767,19 @@ class Executor(RemoteExecutor):
 
         ecFlow cannot increment a meter, nor can a task set one on its family
         with --meter, so this reads the value and alters it. Two tasks finishing
-        at the same moment can therefore lose a count. A failed update is only
-        reported, a meter is not worth aborting the task for.
+        at the same moment can therefore lose a count. A failed update, e.g.
+        beyond the maximum, is only reported, a meter is not worth aborting the
+        task for. The monitor task corrects both value and maximum, which
+        checkpoints raise when they add tasks to the family.
         """
         meter = self.meters[rule]
         meter[2] += done
         family = f"{self.families['main'].fullname}/{ecflow_name(rule)}"
-        n, name = meter[1], self.meter_name
+        name = self.meter_name
         return dd(f"""
         # count this task as done on the meter of its rule family
         v=$(ecflow_client --query meter {family}:{name}) && \\
-            ecflow_client --alter change meter {name} $(( v < {n} ? v + 1 : {n} )) {family} || \\
+            ecflow_client --alter change meter {name} $(( v + 1 )) {family} || \\
             echo "Could not update the meter of {family}."
         """)
 

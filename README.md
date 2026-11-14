@@ -14,6 +14,15 @@ already-produced inputs are taken as given. Such tasks need snakemake and this
 plugin on the ecFlow execution host; the task script loads the `python3` and
 `ecflow` modules for that.
 
+## Task order and priorities
+
+Rules and tasks appear in the suite in the topological order of the DAG.
+ecFlow has no priorities, but it submits eligible tasks in definition order
+while limits (e.g. `task_limit`) are full, so jobs with a higher snakemake
+priority (`priority:` in a rule, `--prioritize`) are placed earlier. Jobs a
+prioritized job depends on inherit its priority, so the order stays
+topological. Without priorities the order is unchanged.
+
 ## Monitoring progress
 
 Snakemake's monitoring plugins see nothing of a deployed suite, as ecFlow runs

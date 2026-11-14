@@ -1,3 +1,4 @@
+import re
 import os
 from pathlib import Path
 import time
@@ -329,6 +330,17 @@ class TestDeployedSuite(TestWorkflowsBase):
         assert self.ecflow_client.query("meter", path, "done") == "3"
 
     @handle_testcase
+    def test_priority(self, tmp_path):
+        workdir = self.deploy_and_run("priority", tmp_path)
+        definition = (workdir / self.def_file).read_text()
+        main = definition.split("family main")[1]  # main is the last family
+        # the direct children of main, in definition order
+        children = re.findall(r"^ {4}(?:family|task) (\w+)", main, re.M)
+        assert children == ["prep", "urgent", "early", "late"]
+        for f in ["late.1.out", "late.2.out", "urgent.out"]:
+            assert self.wait_for_file(workdir / f)
+
+    @handle_testcase
     def test_done_tasks(self, tmp_path):
         # A task that need not run is set complete after the upload, not given
         # defstatus complete, which requeue would reset it to.
@@ -336,7 +348,7 @@ class TestDeployedSuite(TestWorkflowsBase):
         with pytest.raises(SystemExit):
             self.run_workflow("meter", tmp_path)
         definition = (workdir / self.def_file).read_text()
-        main = definition.split("family main")[1].split("family clean")[0]
+        main = definition.split("family main")[1]  # main is the last family
         assert "defstatus complete" not in main
         # counted.1.out ships with the testcase
         assert self.get_state("main/counted/sample_1") == "complete"
@@ -352,9 +364,11 @@ class TestDeployedSuite(TestWorkflowsBase):
         # reports the progress in its labels, job output and progress.md
         self.addmeter = 3
         workdir = self.deploy_and_run("meter", tmp_path)
-        # and corrects a rule meter that is off, e.g. after a lost count
+        # and corrects a rule meter that is off, e.g. after a lost count, and its
+        # maximum, e.g. after a checkpoint added tasks
         rule = f"/{self.ecflow_suite_name}/main/counted"
-        self.ecflow_client.alter(rule, "change", "meter", "done", "1")
+        self.ecflow_client.alter(rule, "delete", "meter", "done")
+        self.ecflow_client.alter(rule, "add", "meter", "done", "0,2,1")
         definition = (workdir / self.def_file).read_text()
         monitor = definition.split("task monitor")[1].split("task ")[0]
         assert "defstatus complete" in monitor and "cron" not in monitor
@@ -365,6 +379,9 @@ class TestDeployedSuite(TestWorkflowsBase):
         assert self.ecflow_client.query("label", path, "status").endswith("0 aborted")
         assert self.ecflow_client.query("label", path, "time").startswith("eta 0s")
         assert self.ecflow_client.query("meter", rule, "done") == "3"
+        self.ecflow_client.sync_local()
+        meter = self.ecflow_client.get_defs().find_abs_node(rule).meters
+        assert [(m.min(), m.max()) for m in meter] == [(0, 3)]
         report = workdir / "ecflow_suites" / self.ecflow_suite_name / "progress.md"
         assert self.wait_for_file(report)
         rows = [l.split(" | ") for l in report.read_text().splitlines() if l.startswith("| counted")]
