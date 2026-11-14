@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import List, Generator
 from textwrap import dedent as dd
 
+from tqdm import tqdm
+
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
 from snakemake_interface_executor_plugins.jobs import JobExecutorInterface
@@ -15,6 +17,15 @@ from snakemake.common.tbdstring import TBDString
 from snakemake.utils import format as sm_format
 from pyflow.importer import ecflow  # finds the bindings for this python via $ECFLOW_DIR
 import pyflow as pf
+
+# fewer items than this are quick, so get no progress bar
+PROGRESS_MIN = 1000
+
+
+def progress(items, desc: str):
+    """Iterate over items with a progress bar when there are many of them,
+    and only in a terminal (disable=None)."""
+    return tqdm(items, desc=desc, unit="task", disable=None if len(items) >= PROGRESS_MIN else True)
 
 
 def ecflow_name(name: str) -> str:
@@ -344,7 +355,7 @@ class Executor(RemoteExecutor):
         # id(task) -> path of the script it shares, see share_script
         self.shared_scripts = {}
         # create tasks first
-        for job in self.jobs_and_groups:
+        for job in progress(self.jobs_and_groups, "Creating tasks"):
             self.families[job], tasks[job] = self.create_task(job)
         for rule, meter in self.meters.items():
             meter[0] = self.families["main"].find_node(ecflow_name(rule))
@@ -1086,7 +1097,7 @@ class Executor(RemoteExecutor):
                 families.update({id(f): f for f in node.all_families})
         # the tasks of a rule share one script, see share_script
         written = set()
-        for task in tasks.values():
+        for task in progress(tasks.values(), "Writing scripts"):
             script, includes = task.generate_script()
             path = self.shared_scripts.get(id(task), task.deploy_path)
             if path in written:
