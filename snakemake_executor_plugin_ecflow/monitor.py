@@ -180,8 +180,10 @@ def summarise(defs, suite: str, runs: dict, now: float, window: float) -> dict:
 
 
 def fix_meters(client, defs, suite: str, stats: dict, name: str) -> list:
-    """Set the meter of every rule family under main to the rule's complete tasks,
-    capped at its maximum. Returns (rule, old, new) of the meters that were off."""
+    """Set the meter of every rule family under main to the rule's complete
+    tasks, and its maximum to the rule's tasks, which checkpoints change when
+    they add tasks to the family. Returns (rule, old, new) of the meters that
+    were off, as "value/max"."""
     main = defs.find_abs_node(f"/{suite}/main")
     fixed = []
     for family in main.nodes:
@@ -190,10 +192,19 @@ def fix_meters(client, defs, suite: str, stats: dict, name: str) -> list:
         meter = next((m for m in family.meters if m.name() == name), None)
         if meter is None:
             continue
-        value = max(meter.min(), min(stats[family.name()]["complete"], meter.max()))
-        if meter.value() != value:
-            client.alter(family.get_abs_node_path(), "change", "meter", name, str(value))
-            fixed.append((family.name(), meter.value(), value))
+        r = stats[family.name()]
+        path = family.get_abs_node_path()
+        top = max(meter.min() + 1, r["tasks"])
+        value = max(meter.min(), min(r["complete"], top))
+        if meter.max() != top:
+            # ecFlow can only change a meter's value, so it is replaced
+            client.alter(path, "delete", "meter", name)
+            client.alter(path, "add", "meter", name, f"{meter.min()},{top},{value}")
+        elif meter.value() != value:
+            client.alter(path, "change", "meter", name, str(value))
+        else:
+            continue
+        fixed.append((family.name(), f"{meter.value()}/{meter.max()}", f"{value}/{top}"))
     return fixed
 
 
@@ -264,7 +275,7 @@ def main(argv=None):
     p.add_argument("--window", default=24, type=float, help="Hours of completions the rate is taken over")
     p.add_argument("--meters", nargs="?", const="done", metavar="NAME",
                    help="Set the meters of this name (default: done) on the rule families "
-                        "to the rule's complete tasks")
+                        "to the rule's complete tasks, and their maximum to its tasks")
     p.add_argument("--labels", action="store_true",
                    help="Set the progress, status and time labels of the ecFlow task this runs in")
     a = p.parse_args(argv)
