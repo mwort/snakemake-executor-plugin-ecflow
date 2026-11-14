@@ -368,6 +368,9 @@ class Executor(RemoteExecutor):
                 nodes = {tasks[self.groups[j] if j.group else j] for j in deps}
                 task.triggers = self.build_trigger(nodes)
         self.cleanup_tasks = self.create_cleanup_tasks(tasks)
+        # family_sizes was cached before the clean families existed, without
+        # them cover_nodes lists every cleanup task of a checkpoint's dependents
+        self.__dict__.pop("_family_sizes", None)
         self.add_checkpoint_deploy_nodes(tasks)
         return tasks
 
@@ -557,9 +560,13 @@ class Executor(RemoteExecutor):
             if not checkpoints:
                 continue
             nodes = self.downstream_nodes(checkpoints, tasks)
-            paths = dict.fromkeys(self.node_path(n) for n in nodes)
+            paths = ",".join(dict.fromkeys(self.node_path(n) for n in nodes))
+            # exported into the job, where one variable may not exceed 128 KiB
+            if len(paths) > 100_000:
+                print(f"Warning: {task.fullname} has to redeploy {len(nodes)} nodes, too many for its "
+                      "job's environment, every command in it will fail with 'Argument list too long'.")
             with task:
-                pf.Variable("CHECKPOINT_DEPLOY", ",".join(paths))
+                pf.Variable("CHECKPOINT_DEPLOY", paths)
 
     def checkpoint_rebuild_script(self, rule: str) -> str:
         """Tail appended to a checkpoint task, re-expanding its own subtree.
