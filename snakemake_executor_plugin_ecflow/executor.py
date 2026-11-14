@@ -414,6 +414,9 @@ class Executor(RemoteExecutor):
                     script="rm -rf $TEMP",
                     TEMP=" ".join(temp),
                     triggers=self.build_trigger(consumers),
+                    # a batch job like any other: without the limit, a backlog of
+                    # them is submitted at once, past the scheduler's submit limit
+                    inlimits=[self.task_limit],
                 )
             # also to run when the producer is done but its temp files are still there
             if not any(dag.needrun(j) for j in jobs) and not any(os.path.exists(f) for f in temp):
