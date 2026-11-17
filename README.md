@@ -14,14 +14,30 @@ already-produced inputs are taken as given. Such tasks need snakemake and this
 plugin on the ecFlow execution host; the task script loads the `python3` and
 `ecflow` modules for that.
 
-## Task order and priorities
+## Task order, priorities and rule limits
 
-Rules and tasks appear in the suite in the topological order of the DAG.
-ecFlow has no priorities, but it submits eligible tasks in definition order
-while limits (e.g. `task_limit`) are full, so jobs with a higher snakemake
-priority (`priority:` in a rule, `--prioritize`) are placed earlier. Jobs a
-prioritized job depends on inherit its priority, so the order stays
-topological. Without priorities the order is unchanged.
+ecFlow has no priorities, but while limits (e.g. `task_limit`) are full it
+submits the eligible tasks in the order of the suite definition. The triggers
+keep the dependencies, so tasks are ordered by what should run first instead:
+
+1. their snakemake priority (`priority:` in a rule, `--prioritize`)
+2. their distance to the end of the workflow, the nearest first, so what is
+   closest to done is finished first and `temp()` files are consumed, and
+   removed, before more are made
+3. their topological order, and by wildcards within a rule
+
+A rule's family takes the place of its first task, so without priorities the
+rule families of `main` come in reverse topological order, e.g. `archive`
+before `convert` before `retrieve`.
+
+A rule with more tasks than `task_limit` (`--jobs`) gets a `rule_limit` of the
+same size on its family. It changes nothing until lowered in the running suite,
+e.g. to keep a rule that makes temp files faster than they are consumed from
+taking all the task slots:
+
+    ecflow_client --alter change limit_max rule_limit 3 /SUITE/main/RULE
+
+It also shows on the family how many of its tasks are submitted or active.
 
 ## Monitoring progress
 

@@ -1,7 +1,6 @@
 import sys
 import os
 import re
-import heapq
 import shutil
 from pathlib import Path
 from typing import List, Generator
@@ -609,10 +608,11 @@ class Executor(RemoteExecutor):
             for job in sorted(layer, key=lambda j: j.wildcards)
             if job.output
         ]
-        jobs = self.prioritize(jobs)
+        # tasks are created in this order, while jobs stays topological, the
+        # order a group task runs its jobs in
         groups_seen = set()
         sorted_jobs_or_groups = []
-        for job in jobs:
+        for job in self.prioritize(jobs):
             if job.group is None:
                 sorted_jobs_or_groups.append(job)
             else:
@@ -645,39 +645,28 @@ class Executor(RemoteExecutor):
             return 0
 
     def prioritize(self, jobs: list) -> list:
-        """Reorder topologically sorted jobs by their snakemake priority.
+        """Order topologically sorted jobs as ecFlow should prefer them.
 
-        ecFlow has no priorities, but submits eligible tasks in the order of
-        the suite definition until the limits are full, so jobs with a higher
-        priority (rule priority, --prioritize) are placed earlier. A job
-        inherits the highest priority of the jobs depending on it, so it still
-        comes before them, i.e. the order stays topological. Among jobs of
-        equal priority the given order is kept, so without priorities nothing
-        changes.
+        ecFlow has no priorities, but while the limits are full it submits the
+        eligible tasks in the order of the suite definition. The triggers keep
+        the dependencies, so the definition needn't be topological, and jobs
+        are sorted by:
+
+        1. their snakemake priority (rule priority, --prioritize, which the dag
+           already passes on to the jobs a prioritized one depends on)
+        2. their distance to the end of the workflow, the longest path to a
+           job nothing depends on, the nearest first: what is closest to done
+           is finished first, and temp() files are consumed, so they can be
+           removed, before more are made
+        3. the given order, e.g. by wildcards within a rule
         """
         dag = self.workflow.dag
+        distance = {}
+        for job in reversed(jobs):  # those depending on a job come after it
+            after = [distance[d] for d in dag.depending[job] if d in distance]
+            distance[job] = 1 + max(after) if after else 0
         index = {job: i for i, job in enumerate(jobs)}
-        priority = {job: self.job_priority(job) for job in jobs}
-        if len(set(priority.values())) <= 1:
-            return jobs
-        for job in reversed(jobs):
-            for d in dag.depending[job]:
-                if d in priority:
-                    priority[job] = max(priority[job], priority[d])
-        # Kahn's algorithm, taking the ready job with the highest priority
-        waiting = {job: sum(d in index for d in dag.dependencies[job]) for job in jobs}
-        ready = [(-priority[j], index[j], j) for j in jobs if not waiting[j]]
-        heapq.heapify(ready)
-        ordered = []
-        while ready:
-            job = heapq.heappop(ready)[2]
-            ordered.append(job)
-            for d in dag.depending[job]:
-                if d in waiting:
-                    waiting[d] -= 1
-                    if not waiting[d]:
-                        heapq.heappush(ready, (-priority[d], index[d], d))
-        return ordered
+        return sorted(jobs, key=lambda j: (-self.job_priority(j), distance[j], index[j]))
 
     def create_task(self, job: JobExecutorInterface, **kwargs) -> pf.Task:
         if job.is_group():
