@@ -92,6 +92,7 @@ class Executor(RemoteExecutor):
     load_python = "module load python3"
     load_ecflow = "module load ecflow"
     meter_name = "done"
+    rule_limit_name = "rule_limit"
 
     @property
     def load_snakemake(self) -> str:
@@ -332,6 +333,7 @@ class Executor(RemoteExecutor):
         self.done_tasks = []  # tasks that need not run, see set_done
         dag = self.workflow.dag
         self.jobs_and_groups, self.jobs, self.groups = self.get_jobs_and_groups()
+        self.warn_capped_threads()
         # global task limit and one limit per --resources entry (other than
         # snakemake's own _cores/_nodes), attached to the admin family
         with self.families["admin"]:
@@ -383,6 +385,24 @@ class Executor(RemoteExecutor):
             if tokens:
                 limits.append(TokenInLimit(limit, int(tokens)))
         return limits
+
+    def warn_capped_threads(self):
+        """Warn about rules whose threads --cores caps.
+
+        snakemake caps the threads of a job at --cores, which defaults to the
+        cpus of the machine it runs on. The tasks run elsewhere, so deploying
+        from a small (e.g. interactive) session would silently give them fewer.
+        """
+        cores = self.workflow.resource_settings.cores
+        capped = {}
+        for job in self.jobs:
+            threads = job.rule.resources.get("_cores")
+            if isinstance(threads, int) and threads > job.threads:
+                capped[job.rule.name] = (threads, job.threads)
+        for rule, (wanted, got) in capped.items():
+            self.logger.warning(
+                f"Rule {rule} asks for {wanted} threads but gets {got}, capped by --cores {cores} "
+                "(by default the cpus of this machine). Pass a larger --cores, e.g. in the profile.")
 
     @staticmethod
     def temp_outputs(job: JobExecutorInterface) -> list:
