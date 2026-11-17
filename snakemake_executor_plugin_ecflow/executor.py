@@ -270,10 +270,14 @@ class Executor(RemoteExecutor):
         ecfsets.pop("linked", None)
         ecfsets.update(overrides)
         # --nolock: a rebuild only deploys, it writes no outputs, and several
-        # checkpoint tasks of one suite can rebuild at the same time
+        # checkpoint tasks of one suite can rebuild at the same time.
+        # --cores: snakemake caps the threads of every rule at it, and defaults
+        # it to the cpus of the machine it runs on, which for a checkpoint is
+        # its own (often single cpu) batch job, so pass on this run's
         parts = [
             f"{self.get_python_executable()} -m snakemake"
             f" -s {self.get_snakefile()} -j 1 --nolock --executor ecflow"
+            f" --cores {self.workflow.resource_settings.cores}"
         ]
         parts += self.profile_args
         parts += [
@@ -352,6 +356,10 @@ class Executor(RemoteExecutor):
         self.meters = {
             rule: [None, n, 0] for rule, n in counts.items() if addmeter and n >= addmeter
         }
+        # rules with more tasks than the task limit get a limit of their own on
+        # their family, see rule_limit; the others could not exceed it anyway
+        self.limited_rules = {rule for rule, n in counts.items() if n > self.workflow.nodes}
+        self.rule_limits = {}
         # rule -> (script, resources) of its first job, see create_task
         self.rule_scripts = {}
         # id(task) -> path of the script it shares, see share_script
@@ -403,6 +411,26 @@ class Executor(RemoteExecutor):
             self.logger.warning(
                 f"Rule {rule} asks for {wanted} threads but gets {got}, capped by --cores {cores} "
                 "(by default the cpus of this machine). Pass a larger --cores, e.g. in the profile.")
+
+    def rule_limit(self, rule: str) -> pf.Limit:
+        """The limit on the family of a rule, which all its tasks are in.
+
+        It starts at the task limit, so it changes nothing until it is
+        lowered in the running suite, by hand or by a monitor, to keep a rule
+        from taking all the task slots (e.g. one making temp() files faster
+        than they are consumed). On the rule's family it also shows how many
+        of its tasks are submitted or active.
+        """
+        if rule not in self.rule_limits:
+            main, name = self.families["main"], ecflow_name(rule)
+            try:
+                family = main.find_node(name)
+            except KeyError:
+                with main:
+                    family = pf.AnchorFamily(name)
+            with family:
+                self.rule_limits[rule] = pf.Limit(self.rule_limit_name, self.workflow.nodes)
+        return self.rule_limits[rule]
 
     @staticmethod
     def temp_outputs(job: JobExecutorInterface) -> list:
@@ -731,6 +759,8 @@ class Executor(RemoteExecutor):
         kwargs.update(variables)
         kwargs.update(ecflow_params)
         kwargs["inlimits"] = self.inlimits(jobs)
+        if not job.is_group() and job.rule.name in self.limited_rules:
+            kwargs["inlimits"].append(self.rule_limit(job.rule.name))
 
         # take the max of resources for all jobs
         sargs = [self.translate_resources(j) for j in jobs]

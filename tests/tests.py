@@ -336,8 +336,22 @@ class TestDeployedSuite(TestWorkflowsBase):
         main = definition.split("family main")[1]  # main is the last family
         # the direct children of main, in definition order
         children = re.findall(r"^ {4}(?:family|task) (\w+)", main, re.M)
-        assert children == ["prep", "urgent", "early", "late"]
+        assert children == ["urgent", "late", "prep", "early"]
         for f in ["late.1.out", "late.2.out", "urgent.out"]:
+            assert self.wait_for_file(workdir / f)
+
+    @handle_testcase
+    def test_rule_limit(self, tmp_path):
+        # a rule with more tasks than the task limit (3 jobs in the tests) gets
+        # a limit of that size on its family, which all its tasks are in
+        workdir = self.deploy_and_run("rule_limit", tmp_path)
+        definition = (workdir / self.def_file).read_text()
+        families = {b.split()[0]: b.split("task ")[0] for b in definition.split("family ")[1:]}
+        assert "limit rule_limit 3" in families["many"]
+        assert "limit rule_limit" not in families["few"]
+        limit = f"inlimit /{self.ecflow_suite_name}/main/many:rule_limit\n"
+        assert definition.count(limit) == 4
+        for f in [f"many.{i}.out" for i in range(1, 5)] + ["few.1.out", "few.2.out"]:
             assert self.wait_for_file(workdir / f)
 
     @handle_testcase
